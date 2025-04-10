@@ -11,19 +11,19 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
-# Load local environment variables from a .env file (for local development)
+# Load environment variables from .env (for local development)
 load_dotenv()
 
 # --- Configuration ---
 QUESTION = "What are the key ethical considerations when deploying AI systems in society?"
 
-# Retrieve the OpenAI API key from the environment
+# Get the OpenAI API key from environment variables.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY environment variable not set!")
 openai.api_key = OPENAI_API_KEY
 
-# Use the model id as desired. (Here we use "gpt-4o-mini")
+# Use the model id as desired.
 MODEL_NAME = "gpt-4o-mini"
 
 # --- Google Sheets Setup ---
@@ -32,13 +32,15 @@ def get_worksheet():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-    # Try to load the service account credentials from the environment variable.
     credentials_json = os.environ.get("GCP_CREDENTIALS")
     if credentials_json:
         creds_info = json.loads(credentials_json)
+        # Fix the private key formatting if needed:
+        if "private_key" in creds_info:
+            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
     else:
-        # Fallback for local development (make sure this file is NOT committed).
+        # Fallback for local development: read from file.
         creds_file = "mystic-castle-452716-r3-06468c3f2be8.json"
         creds = Credentials.from_service_account_file(creds_file, scopes=scopes)
     client = gspread.authorize(creds)
@@ -62,7 +64,6 @@ Please evaluate how effectively the response answered the question. Judge the re
 {{"creativity": {{"score": [score for creativity], "comments": "[comments for creativity]"}}, "insightfulness": {{"score": [score for insightfulness], "comments": "[comments for insightfulness]"}}, "relevance": {{"score": [score for relevance], "comments": "[comments for relevance]"}}}}
 </output_format>
 </PromptForGPT>"""
-
     response = openai.ChatCompletion.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt_text}]
@@ -145,13 +146,12 @@ if st.button("Submit Response"):
                 st.success("Your response has been evaluated and stored in Google Sheets!")
                 st.write("### Evaluation Result")
                 eval_df = build_evaluation_df(evaluation)
-                # For each criterion, display the score and a scrollable, read-only text area for comments.
                 for idx, row in eval_df.iterrows():
                     st.write(f"**{row['Criterion']}**: Score: {row['Score']}")
                     st.text_area(
                         f"{row['Criterion']} Comments",
                         value=row["Comments"],
-                        height=150,  # Increased height to enable scrolling if text is long
+                        height=150,
                         disabled=True,
                         key=row["Criterion"]
                     )
