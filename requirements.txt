@@ -1,6 +1,6 @@
 pandas
 altair
-openai
+openai==0.28.0
 gspread
 google-auth
 python-dotenv
