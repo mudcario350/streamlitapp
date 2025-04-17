@@ -1,0 +1,6 @@
+pandas
+altair
+openai
+gspread
+google-auth
+python-dotenv
