@@ -9,7 +9,7 @@ import openai
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- Configuration / Secrets ---
+# --- Configuration & Secrets ---
 if "gcp" not in st.secrets or "openai" not in st.secrets:
     st.error("Required secrets not found in st.secrets! Please configure GCP and OpenAI secrets.")
     st.stop()
@@ -48,26 +48,26 @@ def get_r1_answers_worksheet():
         ws = spreadsheet.worksheet("R1 Answers")
     except gspread.exceptions.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title="R1 Answers", rows="1000", cols="10")
-        # Initialize header row
         headers = ["Timestamp", "ID", "Question1_Answer", "Question2_Answer", "Question3_Answer"]
         ws.update(values=[headers], range_name="A1:E1")
     return ws
 
+# --- Load & ensure evaluation sheet headers ---
 def load_data_from_sheet(student_id):
     ws = get_student_worksheet(student_id)
     expected = [
         "Timestamp",
-        "User Response",
         "Creativity Score", "Creativity Comments",
         "Insightfulness Score", "Insightfulness Comments",
         "Relevance Score",    "Relevance Comments"
     ]
+    # fix headers if needed
     if ws.row_values(1) != expected:
-        ws.update(values=[expected], range_name="A1:H1")
-    recs = ws.get_all_records(expected_headers=expected)
-    return pd.DataFrame(recs) if recs else pd.DataFrame(columns=expected)
+        ws.update(values=[expected], range_name="A1:G1")
+    records = ws.get_all_records(expected_headers=expected)
+    return pd.DataFrame(records) if records else pd.DataFrame(columns=expected)
 
-# --- Fetch the three dynamic questions ---
+# --- Fetch dynamic questions from QUESTIONS sheet ---
 def load_questions():
     client      = get_gs_client()
     spreadsheet = client.open(SPREADSHEET_NAME)
@@ -91,7 +91,7 @@ def load_questions():
 
 q1, q2, q3 = load_questions()
 
-# --- OpenAI evaluation call ---
+# --- OpenAI evaluation call (only for Q1) ---
 def call_chatgpt(user_response, question):
     prompt = f"""<PromptForGPT>
 <response>
@@ -107,7 +107,6 @@ Please evaluate how effectively the response answered the question. Judge the re
 {{"creativity": {{"score": [score for creativity], "comments": "[comments for creativity]"}}, "insightfulness": {{"score": [score for insightfulness], "comments": "[comments for insightfulness]"}}, "relevance": {{"score": [score for relevance], "comments": "[comments for relevance]"}}}}
 </output_format>
 </PromptForGPT>"""
-
     resp = openai.ChatCompletion.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}]
@@ -115,12 +114,11 @@ Please evaluate how effectively the response answered the question. Judge the re
     return resp.choices[0].message.content.strip()
 
 # --- Appenders ---
-def append_to_sheet(student_id, user_response, evaluation):
+def append_to_sheet(student_id, evaluation):
     ws = get_student_worksheet(student_id)
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [
         ts,
-        user_response,
         evaluation["creativity"]["score"],
         evaluation["creativity"]["comments"],
         evaluation["insightfulness"]["score"],
@@ -133,10 +131,9 @@ def append_to_sheet(student_id, user_response, evaluation):
 def append_to_r1_answers(student_id, a1, a2, a3):
     ws = get_r1_answers_worksheet()
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = [ts, student_id, a1, a2, a3]
-    ws.append_row(row)
+    ws.append_row([ts, student_id, a1, a2, a3])
 
-# --- Build a neat DataFrame for evaluation display ---
+# --- Build DataFrame for display of evaluation ---
 def build_evaluation_df(evaluation):
     return pd.DataFrame({
         "Criterion": ["Creativity", "Insightfulness", "Relevance"],
@@ -152,7 +149,7 @@ def build_evaluation_df(evaluation):
         ]
     })
 
-# --- Streamlit App UI ---
+# --- Streamlit UI ---
 student_id = st.text_input("Please enter your student ID:").strip()
 if not student_id:
     st.info("Enter your student ID to proceed.")
@@ -173,10 +170,10 @@ if st.button("Submit Responses"):
     if not answer1.strip():
         st.error("Please enter a non-empty response for Question 1.")
     else:
-        # 1) Record raw answers
+        # 1) Log all three raw answers only into R1 Answers
         append_to_r1_answers(student_id, answer1, answer2, answer3)
 
-        # 2) Evaluate Q1 only
+        # 2) Evaluate Question 1
         with st.spinner("Evaluating your response to Question 1..."):
             raw_eval = call_chatgpt(answer1, q1)
             try:
@@ -186,9 +183,9 @@ if st.button("Submit Responses"):
                 st.code(raw_eval)
                 evaluation = None
 
-        # 3) If good, store & show
+        # 3) Store evaluation (no raw response) in student sheet and show it
         if evaluation:
-            append_to_sheet(student_id, answer1, evaluation)
+            append_to_sheet(student_id, evaluation)
             st.success("Your response has been evaluated and stored!")
             st.write("### Evaluation Result")
             df_eval = build_evaluation_df(evaluation)
@@ -202,8 +199,8 @@ if st.button("Submit Responses"):
                     key=row["Criterion"]
                 )
 
-# --- Display stored evaluations & averages ---
-st.subheader(f"Stored Responses for Student ID: {student_id}")
+# --- Display stored evaluations & averages per student ---
+st.subheader(f"Stored Evaluations for Student ID: {student_id}")
 df = load_data_from_sheet(student_id)
 if not df.empty:
     for col in ["Creativity Score", "Insightfulness Score", "Relevance Score"]:
@@ -220,10 +217,10 @@ if not df.empty:
     chart = (
         alt.Chart(avg_scores)
         .mark_bar()
-        .encode(x=alt.X("Criterion", sort=None), y="Average Score")
+        .encode( x=alt.X("Criterion", sort=None), y="Average Score" )
         .properties(width=600)
     )
     st.altair_chart(chart, use_container_width=True)
 else:
-    st.info("No responses stored for this student ID yet.")
+    st.info("No evaluations stored for this student ID yet.")
 
