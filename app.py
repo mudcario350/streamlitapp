@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 
-import json
+import time
 import datetime
 import pandas as pd
-import altair as alt
 import streamlit as st
-import openai
 import gspread
 from google.oauth2.service_account import Credentials
 
 # --- Configuration & Secrets ---
-if "gcp" not in st.secrets or "openai" not in st.secrets:
-    st.error("Required secrets not found in st.secrets! Please configure GCP and OpenAI secrets.")
+if "gcp" not in st.secrets:
+    st.error("GCP credentials not found in st.secrets! Please configure GCP secrets.")
     st.stop()
 
 gcp_creds        = st.secrets["gcp"]
-OPENAI_API_KEY   = st.secrets["openai"].get("api_key", "")
-MODEL_NAME       = st.secrets["openai"].get("model_name", "gpt-4o-mini")
 SPREADSHEET_NAME = "n8nTest"
-
-if not OPENAI_API_KEY:
-    st.error("OpenAI API key not found in st.secrets!")
-    st.stop()
-openai.api_key = OPENAI_API_KEY
 
 # --- Google Sheets Helpers ---
 def get_gs_client():
@@ -32,14 +23,6 @@ def get_gs_client():
     ]
     creds  = Credentials.from_service_account_info(gcp_creds, scopes=scopes)
     return gspread.authorize(creds)
-
-def get_student_worksheet(student_id):
-    client      = get_gs_client()
-    spreadsheet = client.open(SPREADSHEET_NAME)
-    try:
-        return spreadsheet.worksheet(student_id)
-    except gspread.exceptions.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=student_id, rows="100", cols="20")
 
 def get_r1_answers_worksheet():
     client      = get_gs_client()
@@ -52,36 +35,35 @@ def get_r1_answers_worksheet():
         ws.update(values=[headers], range_name="A1:E1")
     return ws
 
-# --- Load & ensure evaluation sheet headers ---
-def load_data_from_sheet(student_id):
-    ws = get_student_worksheet(student_id)
-    expected = [
-        "Timestamp",
-        "Creativity Score", "Creativity Comments",
-        "Insightfulness Score", "Insightfulness Comments",
-        "Relevance Score",    "Relevance Comments"
-    ]
-    # fix headers if needed
-    if ws.row_values(1) != expected:
-        ws.update(values=[expected], range_name="A1:G1")
-    records = ws.get_all_records(expected_headers=expected)
-    return pd.DataFrame(records) if records else pd.DataFrame(columns=expected)
+def get_r1_evaluation_worksheet():
+    client      = get_gs_client()
+    spreadsheet = client.open(SPREADSHEET_NAME)
+    try:
+        ws = spreadsheet.worksheet("R1 Evaluation")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title="R1 Evaluation", rows="1000", cols="10")
+        headers = [
+            "ID",
+            "Answer1 Grade", "Answer1 Feedback",
+            "Answer2 Grade", "Answer2 Feedback",
+            "Answer3 Grade", "Answer3 Feedback",
+            "Average", "General Feedback"
+        ]
+        ws.update(values=[headers], range_name="A1:I1")
+    return ws
 
-# --- Fetch dynamic questions from QUESTIONS sheet ---
 def load_questions():
     client      = get_gs_client()
     spreadsheet = client.open(SPREADSHEET_NAME)
     try:
         q_sheet = spreadsheet.worksheet("QUESTIONS")
     except gspread.exceptions.WorksheetNotFound:
-        st.error("QUESTIONS sheet not found in the spreadsheet.")
+        st.error("QUESTIONS sheet not found.")
         st.stop()
-
     recs = q_sheet.get_all_records()
     if not recs:
         st.error("No questions found in QUESTIONS sheet.")
         st.stop()
-
     last = recs[-1]
     return (
         last.get("Question1", ""),
@@ -89,74 +71,49 @@ def load_questions():
         last.get("Question3", "")
     )
 
-q1, q2, q3 = load_questions()
-
-# --- OpenAI evaluation call (only for Q1) ---
-def call_chatgpt(user_response, question):
-    prompt = f"""<PromptForGPT>
-<response>
-{user_response}
-</response>
-<question>
-{question}
-</question>
-<prompt>
-Please evaluate how effectively the response answered the question. Judge the response on three criteria, creativity, insightfulness, and relevance. Come up with comments that could be used to improve the response for each of these criteria, and also come up with a numerical grade out of 10, you can use up to one decimal place for each. Try to be thoughtful in your evaluations, and do not be afraid to give the response low numerical grades if it is not creative, insightful, or relevant.
-</prompt>
-<output_format>
-{{"creativity": {{"score": [score for creativity], "comments": "[comments for creativity]"}}, "insightfulness": {{"score": [score for insightfulness], "comments": "[comments for insightfulness]"}}, "relevance": {{"score": [score for relevance], "comments": "[comments for relevance]"}}}}
-</output_format>
-</PromptForGPT>"""
-    resp = openai.ChatCompletion.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return resp.choices[0].message.content.strip()
-
-# --- Appenders ---
-def append_to_sheet(student_id, evaluation):
-    ws = get_student_worksheet(student_id)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = [
-        ts,
-        evaluation["creativity"]["score"],
-        evaluation["creativity"]["comments"],
-        evaluation["insightfulness"]["score"],
-        evaluation["insightfulness"]["comments"],
-        evaluation["relevance"]["score"],
-        evaluation["relevance"]["comments"]
-    ]
-    ws.append_row(row)
-
 def append_to_r1_answers(student_id, a1, a2, a3):
     ws = get_r1_answers_worksheet()
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ws.append_row([ts, student_id, a1, a2, a3])
 
-# --- Build DataFrame for display of evaluation ---
-def build_evaluation_df(evaluation):
-    return pd.DataFrame({
-        "Criterion": ["Creativity", "Insightfulness", "Relevance"],
-        "Score": [
-            evaluation["creativity"]["score"],
-            evaluation["insightfulness"]["score"],
-            evaluation["relevance"]["score"]
-        ],
-        "Comments": [
-            evaluation["creativity"]["comments"],
-            evaluation["insightfulness"]["comments"],
-            evaluation["relevance"]["comments"]
-        ]
-    })
+def get_last_evaluation_row_index(student_id):
+    ws     = get_r1_evaluation_worksheet()
+    values = ws.get_all_values()  # includes header
+    last_i = 1  # header row
+    for idx, row in enumerate(values[1:], start=2):
+        if str(row[0]) == str(student_id):
+            last_i = max(last_i, idx)
+    return last_i
+
+def poll_for_evaluation(student_id, since_row, interval=1, timeout=300):
+    """
+    Polls every `interval` seconds (now 1s) until a new row for `student_id` appears
+    beyond `since_row`. Times out after `timeout` seconds.
+    """
+    ws    = get_r1_evaluation_worksheet()
+    start = time.time()
+    while True:
+        if time.time() - start > timeout:
+            return None
+        vals   = ws.get_all_values()
+        header = vals[0]
+        for idx, row in enumerate(vals[1:], start=2):
+            if str(row[0]) == str(student_id) and idx > since_row:
+                return dict(zip(header, row))
+        time.sleep(interval)
 
 # --- Streamlit UI ---
+st.title("AI Ethics Peer-Review")
+
 student_id = st.text_input("Please enter your student ID:").strip()
 if not student_id:
     st.info("Enter your student ID to proceed.")
     st.stop()
 
-st.write(f"### Welcome, student {student_id}!")
+# load dynamic questions
+q1, q2, q3 = load_questions()
 
+st.write(f"### Welcome, student {student_id}!")
 st.write(f"**Question 1:** {q1}")
 answer1 = st.text_area("Your response to Question 1:")
 
@@ -170,57 +127,71 @@ if st.button("Submit Responses"):
     if not answer1.strip():
         st.error("Please enter a non-empty response for Question 1.")
     else:
-        # 1) Log all three raw answers only into R1 Answers
+        # record where we were in the evaluation sheet
+        last_idx = get_last_evaluation_row_index(student_id)
+        # append your answers
         append_to_r1_answers(student_id, answer1, answer2, answer3)
 
-        # 2) Evaluate Question 1
-        with st.spinner("Evaluating your response to Question 1..."):
-            raw_eval = call_chatgpt(answer1, q1)
-            try:
-                evaluation = json.loads(raw_eval)
-            except json.JSONDecodeError:
-                st.error("Failed to parse the evaluation response from GPT.")
-                st.code(raw_eval)
-                evaluation = None
-
-        # 3) Store evaluation (no raw response) in student sheet and show it
-        if evaluation:
-            append_to_sheet(student_id, evaluation)
-            st.success("Your response has been evaluated and stored!")
-            st.write("### Evaluation Result")
-            df_eval = build_evaluation_df(evaluation)
-            for _, row in df_eval.iterrows():
-                st.write(f"**{row['Criterion']}**: Score: {row['Score']}")
+        # now poll for the new evaluation row
+        with st.spinner("Waiting for your evaluation from n8n…"):
+            eval_row = poll_for_evaluation(student_id, last_idx)  # now checks every 1s
+        if not eval_row:
+            st.error("Timed out waiting for evaluation. You can still use 'Refresh Evaluation' below.")
+        else:
+            st.success("Evaluation received!")
+            # render it immediately
+            for i in [1,2,3]:
+                grade = eval_row.get(f"Answer{i} Grade", "")
+                fb    = eval_row.get(f"Answer{i} Feedback", "")
+                st.write(f"**Question {i} Grade:** {grade}")
                 st.text_area(
-                    f"{row['Criterion']} Comments",
-                    value=row["Comments"],
+                    f"Feedback for Question {i}",
+                    value=fb,
                     height=150,
                     disabled=True,
-                    key=row["Criterion"]
+                    key=f"Q{i}"
                 )
+            avg = eval_row.get("Average", "")
+            gf  = eval_row.get("General Feedback", "")
+            st.write(f"**Average Score:** {avg}")
+            st.text_area(
+                "General Feedback",
+                value=gf,
+                height=150,
+                disabled=True,
+                key="general"
+            )
 
-# --- Display stored evaluations & averages per student ---
-st.subheader(f"Stored Evaluations for Student ID: {student_id}")
-df = load_data_from_sheet(student_id)
-if not df.empty:
-    for col in ["Creativity Score", "Insightfulness Score", "Relevance Score"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    st.dataframe(df, use_container_width=True)
+st.markdown("---")
+st.header("Refresh Evaluation (manual fallback)")
 
-    avg_scores = (
-        df[["Creativity Score", "Insightfulness Score", "Relevance Score"]]
-        .mean()
-        .reset_index()
-    )
-    avg_scores.columns = ["Criterion", "Average Score"]
-    st.subheader("Average Scores Across Your Responses")
-    chart = (
-        alt.Chart(avg_scores)
-        .mark_bar()
-        .encode( x=alt.X("Criterion", sort=None), y="Average Score" )
-        .properties(width=600)
-    )
-    st.altair_chart(chart, use_container_width=True)
-else:
-    st.info("No evaluations stored for this student ID yet.")
+if st.button("Refresh Evaluation"):
+    row = poll_for_evaluation(student_id, 0, interval=1, timeout=1)
+    if not row:
+        st.warning("No evaluation found for your ID yet.")
+    else:
+        st.success("Loaded your latest evaluation!")
+        for i in [1,2,3]:
+            grade = row.get(f"Answer{i} Grade", "")
+            fb    = row.get(f"Answer{i} Feedback", "")
+            st.write(f"**Question {i} Grade:** {grade}")
+            st.text_area(
+                f"Feedback for Question {i}",
+                value=fb,
+                height=150,
+                disabled=True,
+                key=f"R{i}"
+            )
+        st.write(f"**Average Score:** {row.get('Average','')}")
+        st.text_area(
+            "General Feedback",
+            value=row.get("General Feedback",""),
+            height=150,
+            disabled=True,
+            key="Rgeneral"
+        )
+
+# --- Previously: bottom-of-page table & chart is commented out ---
+# st.subheader(f"Stored Evaluations for Student ID: {student_id}")
+# …
 
