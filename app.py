@@ -2,196 +2,1317 @@
 
 import time
 import datetime
+import json
+from typing import Dict, Any, Optional
+import uuid
+import threading
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
 import streamlit as st
 import gspread
-import requests
 from google.oauth2.service_account import Credentials
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import Tool
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import MessagesState
 
-# --- Configuration & Secrets ---
-if "gcp" not in st.secrets:
-    st.error("GCP credentials not found in st.secrets! Please configure GCP secrets.")
-    st.stop()
-if "n8n" not in st.secrets or "webhook_url" not in st.secrets["n8n"]:
-    st.error("n8n webhook URL not found in st.secrets! Please configure under n8n.webhook_url.")
-    st.stop()
+# Import scroll component
+try:
+    from streamlit_scroll_to_top import scroll_to_here
+    SCROLL_AVAILABLE = True
+except ImportError:
+    SCROLL_AVAILABLE = False
+    st.warning("streamlit-scroll-to-top not installed. Run: pip install streamlit-scroll-to-top")
 
-# Secrets & constants
-GCP_CREDS        = st.secrets["gcp"]
-SPREADSHEET_NAME = "n8nTest"
-N8N_WEBHOOK_URL  = st.secrets["n8n"]["webhook_url"]
+# Import our custom modules
+from config import (
+    SPREADSHEET_NAME, THRESHOLD_SCORE, 
+    PROMPT_DOC_IDS, PROMPT_NAMES,
+    get_openai_api_key, get_gcp_credentials, get_gemini_api_key,
+    LLM_PROVIDER, DEFAULT_MODEL
+)
+from prompt_manager import PromptManager, get_default_prompts
 
-# --- Google Sheets Helpers ---
+# Page config must be first
+st.set_page_config(page_title='Dynamic AI Assignment', layout='centered')
 
-def get_gs_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds  = Credentials.from_service_account_info(GCP_CREDS, scopes=scopes)
-    return gspread.authorize(creds)
+# --- Custom CSS for Modern Look ---
+st.markdown('''
+    <style>
+    body {
+        background-color: #f7f9fa;
+    }
+    .main {
+        background-color: #fff;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        padding: 2rem 2rem 1rem 2rem;
+        margin-top: 1.5rem;
+        color: #222;
+    }
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 1.5rem;
+    }
+    .question-card {
+        background: rgba(200,210,220,0.18) !important;
+        border-radius: 10px;
+        padding: 0.7rem 1rem 0.7rem 1rem;
+        margin-bottom: 0.7rem;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+        color: #fff !important;
+        font-size: 1.08rem;
+        font-weight: 400;
+    }
+    .question-card, .question-card * {
+        color: #fff !important;
+    }
+    .question-card h3, .feedback-card h3, .main h1, .main h2, .main h3 {
+        color: #fff !important;
+        font-size: 1.25rem !important;
+        margin-bottom: 0.3rem !important;
+        margin-top: 0.3rem !important;
+        font-weight: 400 !important;
+    }
+    .main h1 {
+        font-size: 1.7rem !important;
+    }
+    .main h2 {
+        font-size: 1.3rem !important;
+    }
+    .main h3 {
+        font-size: 1.1rem !important;
+    }
+    .score-high { color: #2ecc40; font-weight: bold; }
+    .score-mid { color: #f1c40f; font-weight: bold; }
+    .score-low { color: #e74c3c; font-weight: bold; }
+    .stButton>button {
+        border-radius: 8px;
+        padding: 0.5rem 1.2rem;
+        font-size: 1.1rem;
+        background: linear-gradient(90deg, #425066 0%, #7a8ca3 100%) !important;
+        color: #fff !important;
+        border: none;
+        margin-top: 0.5rem;
+    }
+    .stTextInput>div>input, .stTextArea>div>textarea {
+        border-radius: 8px;
+        border: 1px solid #d0d7de;
+        background: #f7f9fa;
+        font-size: 1.1rem;
+    }
+    .stTextInput>div>input:focus, .stTextArea>div>textarea:focus {
+        border: 1.5px solid #4f8cff;
+        background: #fff;
+    }
+    .stAlert {
+        border-radius: 8px;
+    }
+    .footer {
+        margin-top: 2.5rem;
+        text-align: center;
+        color: #888;
+        font-size: 0.95rem;
+    }
+    /* --- FORCE FEEDBACK CARD COLOR OVERRIDE --- */
+    .feedback-card, .feedback-card * {
+        background: rgba(60, 180, 90, 0.10) !important;
+        color: #fff !important;
+    }
+    </style>
+''', unsafe_allow_html=True)
 
+# --- Header/Banner ---
+provider_emoji = "🤖" if LLM_PROVIDER == "gemini" else "🧠"
+provider_name = "Gemini" if LLM_PROVIDER == "gemini" else "OpenAI"
+st.markdown(f"""
+<div style='display: flex; align-items: center; justify-content: center; margin-bottom: 1.2rem;'>
+    <img src='https://img.icons8.com/color/96/000000/artificial-intelligence.png' style='height: 48px; margin-right: 14px;'>
+    <div>
+        <h1 style='margin-bottom: 0.1rem; font-size:1.6rem;'>Dynamic AI Assignment</h1>
+        <p style='margin: 0; font-size:0.9rem; color:#666;'>Powered by {provider_emoji} {provider_name}</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-def get_worksheet(name, headers):
-    client      = get_gs_client()
-    spreadsheet = client.open(SPREADSHEET_NAME)
-    try:
-        ws = spreadsheet.worksheet(name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=name, rows="2000", cols="20")
-        ws.update(values=[headers], range_name="A1:{}1".format(chr(ord('A') + len(headers) - 1)))
-    return ws
-
-
-# Worksheets and headers
-ANSWERS_SHEET    = "Responses"
-EVAL_SHEET       = "Evaluations"
-QUESTIONS_SHEET  = "QUESTIONS"
-ANSW_HEADERS     = ["RecordID","Timestamp","StudentID","ConversationID","Round","Q1","Q2","Q3"]
-EVAL_HEADERS     = ["RecordID","ConversationID","StudentID","Round",
-                    "Q1Grade","Q1Feedback","Q2Grade","Q2Feedback",
-                    "Q3Grade","Q3Feedback","Average","GeneralFeedback"]
-
-
-def generate_record_id(ws):
-    values = ws.get_all_values()
-    if len(values) <= 1:
-        return 1
-    try:
-        ids = [int(row[0]) for row in values[1:] if row[0].isdigit()]
-        return max(ids) + 1 if ids else 1
-    except Exception:
-        return 1
-
-
-def append_response(student_id, conv_id, round_num, a1, a2, a3):
-    ws        = get_worksheet(ANSWERS_SHEET, ANSW_HEADERS)
-    record_id = generate_record_id(ws)
-    ts        = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ws.append_row([record_id, ts, student_id, conv_id, round_num, a1, a2, a3])
-    return record_id
-
-
-def append_evaluation(record):
-    ws = get_worksheet(EVAL_SHEET, EVAL_HEADERS)
-    ws.append_row([record.get(h, "") for h in EVAL_HEADERS])
-
-
-def notify_n8n(payload):
-    try:
-        requests.post(N8N_WEBHOOK_URL, json=payload, timeout=5)
-    except Exception as e:
-        st.warning(f"Failed to notify n8n: {e}")
-
-
-def load_questions():
-    ws = get_worksheet(QUESTIONS_SHEET, [])
-    recs = ws.get_all_records()
-    if not recs:
-        st.error("No questions found in QUESTIONS sheet.")
-        st.stop()
-    last = recs[-1]
-    return last.get("Question1", ""), last.get("Question2", ""), last.get("Question3", "")
-
-
-def poll_for_evaluation(conv_id, round_num, since_row, interval=1, timeout=300):
-    ws    = get_worksheet(EVAL_SHEET, EVAL_HEADERS)
-    start = time.time()
-    while True:
-        if time.time() - start > timeout:
-            return None
-        vals   = ws.get_all_values()
-        header = vals[0]
-        for idx, row in enumerate(vals[1:], start=2):
-            if row[1] == str(conv_id) and int(row[3]) == round_num and idx > since_row:
-                return dict(zip(header, row))
-        time.sleep(interval)
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="AI Ethics Peer-Review", layout="centered")
-st.title("AI Ethics Peer-Review")
-
-# Student ID
-student_id = st.text_input("Enter your Student ID:").strip()
-if not student_id:
-    st.info("Please enter your Student ID to continue.")
-    st.stop()
-
-# Load questions
-q1, q2, q3 = load_questions()
-
-# Initialize session state
-if "conv_id" not in st.session_state:
-    st.session_state.conv_id  = f"C-{student_id}-{int(time.time())}"
-if "round" not in st.session_state:
-    st.session_state.round    = 1
-if "last_eval_row" not in st.session_state:
-    st.session_state.last_eval_row = 1
-
-st.write(f"### Round {st.session_state.round}")
-st.write(f"**Question 1:** {q1}")
-answer1 = st.text_area("Response Q1", key=f"a1_{st.session_state.round}")
-st.write(f"**Question 2:** {q2}")
-answer2 = st.text_area("Response Q2", key=f"a2_{st.session_state.round}")
-st.write(f"**Question 3:** {q3}")
-answer3 = st.text_area("Response Q3", key=f"a3_{st.session_state.round}")
-
-if st.button("Submit"):    
-    if not answer1.strip():
-        st.error("Q1 cannot be empty.")
+# Add this helper at the top (after imports)
+def rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
     else:
-        # record response
-        record_id = append_response(student_id, st.session_state.conv_id,
-                                    st.session_state.round,
-                                    answer1, answer2, answer3)
-        # send for evaluation
-        payload = {"record_id": record_id,
-                   "conversation_id": st.session_state.conv_id,
-                   "student_id": student_id,
-                   "round": st.session_state.round,
-                   "answers": {"q1": answer1, "q2": answer2, "q3": answer3}}
-        notify_n8n(payload)
-        # poll
-        with st.spinner("Waiting for evaluation…"):
-            eval_row = poll_for_evaluation(st.session_state.conv_id,
-                                           st.session_state.round,
-                                           st.session_state.last_eval_row)
-        if not eval_row:
-            st.error("Evaluation timed out. Try refreshing.")
+        st.experimental_rerun()
+
+# Get credentials and initialize prompt manager
+OPENAI_API_KEY = get_openai_api_key()
+GCP_CREDENTIALS = get_gcp_credentials()
+
+# Get Gemini API key if using Gemini
+GEMINI_API_KEY = None
+if LLM_PROVIDER == "gemini":
+    try:
+        GEMINI_API_KEY = get_gemini_api_key()
+    except:
+        st.warning("Gemini API key not found. Falling back to OpenAI.")
+        LLM_PROVIDER = "openai"
+
+# Initialize prompt manager
+@st.cache_resource
+def get_prompt_manager():
+    return PromptManager(GCP_CREDENTIALS)
+
+prompt_manager = get_prompt_manager()
+
+# Generic Google Sheets wrapper with caching
+class Sheet:
+    def __init__(self, client, title: str, headers: list[str]):
+        self.headers = headers
+        self._cache = {}
+        self._cache_timestamp = 0
+        self._cache_ttl = 30  # Cache for 30 seconds
+        ss = client.open(SPREADSHEET_NAME)
+        try:
+            self.ws = ss.worksheet(title)
+        except gspread.exceptions.WorksheetNotFound:
+            self.ws = ss.add_worksheet(title=title, rows="1000", cols=str(len(headers)))
+            self.ws.append_row(headers)
+
+    def get_all(self) -> list[dict]:
+        """Get all records with caching."""
+        current_time = time.time()
+        if (current_time - self._cache_timestamp) < self._cache_ttl and self._cache:
+            return self._cache
+        
+        # Fetch fresh data
+        self._cache = self.ws.get_all_records()
+        self._cache_timestamp = current_time
+        return self._cache
+
+    def is_duplicate(self, data: dict[str, any]) -> bool:
+        # Only check for duplicates based on unique keys (e.g., execution_id, assignment_id, student_id)
+        # If all keys in headers are present and match, consider it a duplicate
+        for rec in self.get_all():
+            if all(str(rec.get(h, "")) == str(data.get(h, "")) for h in self.headers if h in data):
+                return True
+        return False
+
+    def append_row(self, data: dict[str, Any]) -> None:
+        if not self.is_duplicate(data):
+            row = [data.get(h, "") for h in self.headers]
+            self.ws.append_row(row)
+            # Invalidate cache after write
+            self._cache = {}
+            self._cache_timestamp = 0
+
+# Specific sheet classes
+class AssignmentsSheet(Sheet):
+    def __init__(self, client):
+        super().__init__(client, "assignments", [
+            "date", "assignment_id", "Question1", "Question2", "Question3"
+        ])
+
+    def fetch(self, assignment_id: str) -> dict[str, Any]:
+        key = str(assignment_id).strip().lower()
+        for rec in self.get_all():
+            if str(rec.get("assignment_id", "")).strip().lower() == key:
+                return rec
+        return {}
+
+class StudentAssignmentsSheet(Sheet):
+    def __init__(self, client):
+        super().__init__(client, "student_assignments", [
+            "student_id", "student_first_name", "student_last_name",
+            "assignment_id", "assignment_due"
+        ])
+
+    def fetch_current(self, student_id: str) -> dict[str, Any]:
+        sid = student_id.strip()
+        today = datetime.date.today()
+        for rec in self.get_all():
+            if str(rec.get("student_id", "")).strip() == sid:
+                due_str = str(rec.get("assignment_due", "")).strip()
+                due = None
+                for fmt in ("%Y-%m-%d", "%m/%d/%Y"):  # ISO or US
+                    try:
+                        due = datetime.datetime.strptime(due_str, fmt).date()
+                        break
+                    except ValueError:
+                        due = None
+                if due and due >= today:
+                    return rec
+        return {}
+
+class DataSheets:
+    def __init__(self, creds: dict):
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds_obj = Credentials.from_service_account_info(creds, scopes=scopes)
+        client = gspread.authorize(creds_obj)
+        self.assignments = AssignmentsSheet(client)
+        self.student_assignments = StudentAssignmentsSheet(client)
+        self.answers = Sheet(client, "student_answers", [
+            "execution_id", "assignment_id", "student_id",
+            "q1", "q2", "q3", "timestamp"
+        ])
+        self.grading = Sheet(client, "feedback+grading", [
+            "execution_id", "assignment_id", "student_id",
+            "feedback1", "feedback2", "feedback3",
+            "score1", "score2", "score3", "timestamp"
+        ])
+        self.evaluation = Sheet(client, "feedback_evaluation", [
+            "execution_id", "assignment_id", "student_id",
+            "new_feedback1", "new_feedback2", "new_feedback3",
+            "new_score1", "new_score2", "new_score3", "timestamp"
+        ])
+        self.conversations = Sheet(client, "conversations", [
+            "execution_id", "assignment_id", "student_id",
+            "user_msg", "agent_msg", "timestamp"
+        ])
+
+# Initialize sheets
+@st.cache_resource(show_spinner="Loading...")
+def get_sheets() -> DataSheets:
+    return DataSheets(GCP_CREDENTIALS)
+
+sheets = get_sheets()
+
+# --- OLD CONTEXT CACHE SYSTEM (COMMENTED OUT) ---
+# class ContextCache:
+#     """Manages context caches for questions and conversations."""
+#     
+#     def __init__(self):
+#         # Initialize question caches with empty content
+#         self.question_caches = {
+#             'q1': '',
+#             'q2': '', 
+#             'q3': ''
+#         }
+#         self.conversation_cache = ''
+#         self.question_counters = {'q1': 0, 'q2': 0, 'q3': 0}
+#         self.conversation_counter = 0
+#     
+#     def initialize_question_cache(self, question_num: str, question_text: str):
+#         """Initialize a question cache with the question text."""
+#         self.question_caches[f'q{question_num}'] = f"<question_text>{question_text}</question_text>"
+#         self.question_counters[f'q{question_num}'] = 0
+#     
+#     def add_response_and_feedback(self, question_num: str, response: str, feedback: str, score: str = ""):
+#         """Add student response and feedback to question cache."""
+#         q_key = f'q{question_num}'
+#         self.question_counters[q_key] += 1
+#         counter = self.question_counters[q_key]
+#         
+#         score_text = f" (Score: {score})" if score else ""
+#         new_content = f"<response_{counter}>{response}</response_{counter}><feedback_{counter}>{feedback}{score_text}</feedback_{counter}>"
+#         self.question_caches[q_key] += new_content
+#     
+#     def add_conversation(self, question: str, response: str):
+#         """Add conversation Q&A to conversation cache."""
+#         self.conversation_counter += 1
+#         counter = self.conversation_counter
+#         new_content = f"<conversation_question_{counter}>{question}</conversation_question_{counter}><conversation_response_{counter}>{response}</conversation_response_{counter}>"
+#         self.conversation_cache += new_content
+#     
+#     def get_question_context(self, question_num: str) -> str:
+#         """Get the full context for a specific question."""
+#         return self.question_caches.get(f'q{question_num}', '')
+#     
+#     def get_conversation_context(self) -> str:
+#         """Get the full conversation context."""
+#         return self.conversation_cache
+#     
+#     def clear_all(self):
+#         """Clear all caches."""
+#         self.question_caches = {'q1': '', 'q2': '', 'q3': ''}
+#         self.conversation_cache = ''
+#         self.question_counters = {'q1': 0, 'q2': 0, 'q3': 0}
+#         self.conversation_counter = 0
+
+# Initialize context cache
+# @st.cache_resource
+# def get_context_cache():
+#     return ContextCache()
+
+# context_cache = get_context_cache()
+
+# --- NEW LANGGRAPH MEMORY MANAGEMENT SYSTEM ---
+class AssignmentState(MessagesState):
+    """Enhanced state using LangGraph's MessagesState for automatic memory management."""
+    
+    # Core assignment data
+    execution_id: str
+    student_id: str
+    assignment_id: str
+    
+    # Questions and answers
+    questions: Dict[str, str]  # {"q1": "What is...", "q2": "Explain...", "q3": "How does..."}
+    answers: Dict[str, str]   # {"q1": "Student answer...", "q2": "...", "q3": "..."}
+    
+    # Grading results
+    scores: Dict[str, int]    # {"q1": 8, "q2": 7, "q3": 9}
+    feedback: Dict[str, str]  # {"q1": "Good work...", "q2": "Needs improvement...", "q3": "Excellent..."}
+    
+    # Session metadata
+    session_metadata: Dict[str, Any]
+    conversation_ready: bool
+    
+    # Legacy compatibility fields (for smooth transition)
+    question_contexts: Dict[str, str]  # Maintains question-specific context for backward compatibility
+
+# Initialize memory system
+@st.cache_resource
+def get_memory_system():
+    """Initialize LangGraph memory system with persistence."""
+    return MemorySaver()
+
+memory_system = get_memory_system()
+
+# Global state manager for the assignment session
+class AssignmentMemoryManager:
+    """Manages assignment state using LangGraph's memory system."""
+    
+    def __init__(self):
+        self.memory = memory_system
+        self.current_state = None
+    
+    def initialize_assignment_session(self, exec_id: str, sid: str, aid: str, questions: Dict[str, str]) -> AssignmentState:
+        """Initialize a new assignment session with questions."""
+        state = {
+            "messages": [SystemMessage(content=f"Assignment session for student {sid}")],
+            "execution_id": exec_id,
+            "student_id": sid,
+            "assignment_id": aid,
+            "questions": questions,
+            "answers": {"q1": "", "q2": "", "q3": ""},
+            "scores": {},
+            "feedback": {},
+            "session_metadata": {
+                "start_time": datetime.datetime.now().isoformat(),
+                "assignment_id": aid
+            },
+            "conversation_ready": True,
+            "question_contexts": {"q1": "", "q2": "", "q3": ""}
+        }
+        self.current_state = state
+        return state
+    
+    def add_student_answer(self, question_num: str, answer: str):
+        """Add a student's answer to the current state."""
+        if self.current_state:
+            self.current_state["answers"][f"q{question_num}"] = answer
+            # Add to conversation history
+            self.current_state["messages"].append(HumanMessage(content=f"Student answered Q{question_num}: {answer[:100]}..."))
+    
+    def add_grading_result(self, question_num: str, score: int, feedback: str):
+        """Add grading results for a question."""
+        if self.current_state:
+            self.current_state["scores"][f"q{question_num}"] = score
+            self.current_state["feedback"][f"q{question_num}"] = feedback
+            
+            # Add to conversation history
+            self.current_state["messages"].append(AIMessage(content=f"Q{question_num} graded: {score}/10 - {feedback[:100]}..."))
+            
+            # Update question context for backward compatibility
+            q_key = f"q{question_num}"
+            if q_key not in self.current_state["question_contexts"]:
+                self.current_state["question_contexts"][q_key] = ""
+            
+            # Add response and feedback to question context (maintaining backward compatibility)
+            counter = len([msg for msg in self.current_state["messages"] if f"Q{question_num}" in msg.content])
+            score_text = f" (Score: {score})"
+            new_content = f"<response_{counter}>{self.current_state['answers'][f'q{question_num}']}</response_{counter}><feedback_{counter}>{feedback}{score_text}</feedback_{counter}>"
+            self.current_state["question_contexts"][q_key] += new_content
+    
+    def add_conversation(self, question: str, response: str):
+        """Add a conversation exchange to the memory."""
+        if self.current_state:
+            # Add to conversation history
+            self.current_state["messages"].append(HumanMessage(content=question))
+            self.current_state["messages"].append(AIMessage(content=response))
+    
+    def get_question_context(self, question_num: str) -> str:
+        """Get question-specific context (backward compatibility)."""
+        if self.current_state:
+            return self.current_state["question_contexts"].get(f"q{question_num}", "")
+        return ""
+    
+    def get_conversation_context(self) -> str:
+        """Get conversation context from messages (backward compatibility)."""
+        if self.current_state:
+            # Convert messages to conversation context format for backward compatibility
+            conversation_parts = []
+            for msg in self.current_state["messages"]:
+                if isinstance(msg, HumanMessage):
+                    conversation_parts.append(f"Student: {msg.content}")
+                elif isinstance(msg, AIMessage):
+                    conversation_parts.append(f"AI: {msg.content}")
+            return "\n".join(conversation_parts)
+        return ""
+    
+    def get_full_conversation_history(self) -> List:
+        """Get the full conversation history as messages."""
+        if self.current_state:
+            return self.current_state["messages"]
+        return []
+    
+    def clear_session(self):
+        """Clear the current session."""
+        self.current_state = None
+    
+    def get_current_state(self) -> AssignmentState:
+        """Get the current assignment state."""
+        return self.current_state
+
+# Initialize assignment memory manager
+@st.cache_resource
+def get_assignment_memory_manager():
+    return AssignmentMemoryManager()
+
+assignment_memory = get_assignment_memory_manager()
+
+# Backward compatibility wrapper for existing code
+class ContextCache:
+    """Backward compatibility wrapper that uses the new memory system."""
+    
+    def __init__(self):
+        self.memory_manager = assignment_memory
+    
+    def initialize_question_cache(self, question_num: str, question_text: str):
+        """Initialize question cache (maintains backward compatibility)."""
+        if self.memory_manager.current_state:
+            self.memory_manager.current_state["question_contexts"][f"q{question_num}"] = f"<question_text>{question_text}</question_text>"
+    
+    def add_response_and_feedback(self, question_num: str, response: str, feedback: str, score: str = ""):
+        """Add response and feedback (maintains backward compatibility)."""
+        self.memory_manager.add_grading_result(question_num, int(score) if score else 0, feedback)
+    
+    def add_conversation(self, question: str, response: str):
+        """Add conversation (maintains backward compatibility)."""
+        self.memory_manager.add_conversation(question, response)
+    
+    def get_question_context(self, question_num: str) -> str:
+        """Get question context (maintains backward compatibility)."""
+        return self.memory_manager.get_question_context(question_num)
+    
+    def get_conversation_context(self) -> str:
+        """Get conversation context (maintains backward compatibility)."""
+        return self.memory_manager.get_conversation_context()
+    
+    def clear_all(self):
+        """Clear all caches (maintains backward compatibility)."""
+        self.memory_manager.clear_session()
+
+# Initialize context cache for backward compatibility
+@st.cache_resource
+def get_context_cache():
+    return ContextCache()
+
+context_cache = get_context_cache()
+
+# --- Simple Background Writer System ---
+class SimpleBackgroundWriter:
+    """Simple background writer for Google Sheets operations."""
+    
+    def __init__(self, sheets_instance):
+        self.sheets = sheets_instance
+        self.active_threads = []
+    
+    def write_async(self, operation_type: str, data: dict):
+        """Start a background thread to write data to sheets."""
+        def write_worker():
+            try:
+                if operation_type == 'answers':
+                    self.sheets.answers.append_row(data)
+                elif operation_type == 'grading':
+                    self.sheets.grading.append_row(data)
+                elif operation_type == 'evaluation':
+                    self.sheets.evaluation.append_row(data)
+                elif operation_type == 'conversations':
+                    self.sheets.conversations.append_row(data)
+                print(f"[DEBUG] Successfully wrote {operation_type} data to sheets")
+            except Exception as e:
+                print(f"[ERROR] Failed to write {operation_type} data: {e}")
+        
+        # Start background thread
+        thread = threading.Thread(target=write_worker, daemon=True)
+        thread.start()
+        self.active_threads.append(thread)
+        
+        # Clean up completed threads (keep only last 10)
+        self.active_threads = [t for t in self.active_threads if t.is_alive()][-10:]
+    
+    def shutdown(self):
+        """Wait for all active threads to complete."""
+        for thread in self.active_threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+
+# Initialize simple background writer
+@st.cache_resource
+def get_background_writer():
+    return SimpleBackgroundWriter(sheets)
+
+background_writer = get_background_writer()
+
+# Initialize agent with streaming support
+@st.cache_resource
+def get_agent():
+    """Get the appropriate LLM based on configuration."""
+    if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
+        llm = ChatGoogleGenerativeAI(
+            model=DEFAULT_MODEL["gemini"],
+            temperature=0,
+            google_api_key=GEMINI_API_KEY,
+            streaming=True,
+            max_output_tokens=4000,
+            request_timeout=60
+        )
+    else:
+        llm = ChatOpenAI(
+            model_name=DEFAULT_MODEL["openai"], 
+            temperature=0,
+            openai_api_key=OPENAI_API_KEY,
+            streaming=True,  # Enable streaming
+            max_tokens=4000,  # Increased limit to prevent truncation
+            request_timeout=60  # Increased timeout for longer responses
+        )
+    return llm
+
+agent = get_agent()
+
+# Workflow functions
+
+def prompt_student_id() -> Optional[str]:
+    sid = st.text_input('Student ID:', key='sid')
+    if not sid:
+        st.info('Enter your Student ID to proceed.')
+        return None
+    return sid.strip()
+
+
+def load_assignment(sid: str) -> Optional[dict[str, Any]]:
+    rec = sheets.student_assignments.fetch_current(sid)
+    if not rec:
+        st.error('Invalid Student ID or no assignment due.')
+        return None
+    return rec
+
+
+def load_questions(aid: str) -> Optional[dict[str, Any]]:
+    q = sheets.assignments.fetch(aid)
+    if not q:
+        st.error('Assignment questions not found.')
+        return None
+    return q
+
+
+def record_answers(exec_id: str, sid: str, aid: str, answers: dict[str, str]) -> None:
+    """Record answers using background writer for better performance."""
+    data = {
+        'execution_id': exec_id,
+        'assignment_id': aid,
+        'student_id': sid,
+        **answers,
+        'timestamp': datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+    }
+    # Queue for background writing instead of blocking
+    background_writer.write_async('answers', data)
+
+
+# Removed grade_single_question function - now using _make_single_api_call for true parallelism
+
+
+def run_grading_streaming(exec_id: str, sid: str, answers: Dict[str, str]) -> Dict[str, Any]:
+    """True parallel grading - all API calls made simultaneously."""
+    try:
+        # Get contexts once
+        q1_context = context_cache.get_question_context('1')
+        q2_context = context_cache.get_question_context('2') 
+        q3_context = context_cache.get_question_context('3')
+        conversation_context = context_cache.get_conversation_context()
+        
+        # Try to get prompt from Google Docs first
+        doc_id = PROMPT_DOC_IDS.get("grading")
+        prompt_name = PROMPT_NAMES.get("grading")
+        
+        if doc_id and doc_id != "YOUR_GRADING_PROMPT_DOC_ID":
+            prompt_template = prompt_manager.get_cached_prompt(doc_id, prompt_name)
         else:
-            st.success("Evaluation received!")
-            # display
-            for i in [1,2,3]:
-                st.write(f"**Q{i} Grade:** {eval_row.get(f'Q{i}Grade','')}")
-                st.text_area(f"Feedback Q{i}",
-                              value=eval_row.get(f'Q{i}Feedback',''),
-                              height=120, disabled=True)
-            st.write(f"**Average:** {eval_row.get('Average','')}")
-            st.text_area("General Feedback",
-                          value=eval_row.get('GeneralFeedback',''),
-                          height=150, disabled=True)
-            # save eval record row index
-            st.session_state.last_eval_row += 1
-            # prepare for next round
-            st.session_state.round += 1
-            st.experimental_rerun()
+            prompt_template = get_default_prompts()["grading_prompt"]
+        
+        if not prompt_template:
+            prompt_template = get_default_prompts()["grading_prompt"]
+        
+        # Prepare question-specific prompts for each LLM
+        prompts = []
+        for i in range(1, 4):
+            # Get only the relevant answer and context for this question
+            question_answer = answers.get(f'q{i}', 'No answer provided')
+            question_context = q1_context if i == 1 else (q2_context if i == 2 else q3_context)
+            
+            # Create question-specific prompt template
+            question_prompt_template = f"""You are an AI teaching assistant grading student answers. Please evaluate the following answer and provide feedback and score.
 
-# Manual refresh fallback
-st.markdown("---")
-st.header("Manual Refresh Evaluation")
-if st.button("Refresh Evaluation"):
-    refreshed = poll_for_evaluation(st.session_state.conv_id,
-                                     st.session_state.round-1,
-                                     0, timeout=1)
-    if not refreshed:
-        st.warning("No new evaluation yet.")
-    else:
-        st.success("Loaded latest evaluation")
-        for i in [1,2,3]:
-            st.write(f"**Q{i} Grade:** {refreshed.get(f'Q{i}Grade','')}")
-            st.text_area(f"Feedback Q{i}",
-                          value=refreshed.get(f'Q{i}Feedback',''),
-                          height=120, disabled=True)
-        st.write(f"**Average:** {refreshed.get('Average','')}")
-        st.text_area("General Feedback",
-                      value=refreshed.get('GeneralFeedback',''),
-                      height=150, disabled=True)
+Student ID: {sid}
+Execution ID: {exec_id}
+
+Student Answer for Question {i}:
+{question_answer}
+
+Question {i} Context History:
+{question_context}
+
+Previous Conversations:
+{conversation_context}
+
+Please provide your evaluation in the following JSON format:
+{{
+    "execution_id": "{exec_id}",
+    "student_id": "{sid}",
+    "score{i}": <score from 1-10>,
+    "feedback{i}": "<detailed feedback for Q{i}>"
+}}
+
+Be thoughtful in your evaluation. Consider clarity, depth of understanding, and relevance to the question. Use the context history to provide more personalized and relevant feedback."""
+            
+            prompts.append((i, question_prompt_template))
+        
+        # Execute all three API calls simultaneously
+        with st.spinner("Grading your answers..."):
+            start_time = time.time()
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="grading") as executor:
+                # Submit all three API calls at once
+                futures = []
+                for question_num, prompt in prompts:
+                    future = executor.submit(_make_single_api_call, question_num, prompt)
+                    futures.append(future)
+                
+                print(f"[BENCHMARK] All 3 API calls submitted at {time.time() - start_time:.3f}s")
+                
+                # Wait for ALL responses to complete
+                results = []
+                for i, future in enumerate(futures):
+                    try:
+                        result = future.result(timeout=60)  # 60 second timeout per question
+                        results.append(result)
+                        print(f"[BENCHMARK] Q{i+1} API call completed at {time.time() - start_time:.3f}s")
+                    except Exception as e:
+                        print(f"[ERROR] Q{i+1} API call failed: {e}")
+                        results.append({
+                            "execution_id": exec_id,
+                            "student_id": sid,
+                            f"score{i+1}": 5,
+                            f"feedback{i+1}": f"API call failed: {str(e)}"
+                        })
+            
+            total_time = time.time() - start_time
+            print(f"[BENCHMARK] Total parallel grading time: {total_time:.3f}s")
+            print(f"[BENCHMARK] Average time per question: {total_time/3:.3f}s")
+            print(f"[BENCHMARK] Questions completed: {len(results)}/3")
+        
+        # Merge results from all three questions
+        merged_result = {
+            "execution_id": exec_id,
+            "student_id": sid,
+            "score1": 0, "score2": 0, "score3": 0,
+            "feedback1": "", "feedback2": "", "feedback3": ""
+        }
+        
+        for result in results:
+            for i in range(1, 4):
+                score_key = f"score{i}"
+                feedback_key = f"feedback{i}"
+                if score_key in result:
+                    merged_result[score_key] = result[score_key]
+                if feedback_key in result:
+                    merged_result[feedback_key] = result[feedback_key]
+        
+        print("[DEBUG] Parallel API grading result:", merged_result)
+        return merged_result
+        
+    except Exception as e:
+        print(f"[ERROR] Parallel grading failed: {e}")
+        st.error(f"Grading failed: {e}")
+        return {
+            "execution_id": exec_id,
+            "student_id": sid,
+            "score1": 5, "score2": 5, "score3": 5,
+            "feedback1": "Grading error", "feedback2": "Grading error", "feedback3": "Grading error"
+        }
+
+
+def _make_single_api_call(question_num: int, prompt: str) -> Dict[str, Any]:
+    """Make a single API call to the configured LLM for grading with dedicated agent instance."""
+    try:
+        # Create a dedicated agent instance for this thread to avoid conflicts
+        if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
+            thread_agent = ChatGoogleGenerativeAI(
+                model=DEFAULT_MODEL["gemini"],
+                temperature=1,
+                google_api_key=GEMINI_API_KEY,
+                streaming=True,
+                max_output_tokens=4000,
+                request_timeout=60
+            )
+        else:
+            thread_agent = ChatOpenAI(
+                model_name=DEFAULT_MODEL["openai"], 
+                temperature=1,
+                openai_api_key=OPENAI_API_KEY,
+                streaming=True,
+                max_tokens=4000,
+                request_timeout=60
+            )
+        
+        # Use streaming for faster response
+        response_text = ""
+        for chunk in thread_agent.stream(prompt):
+            if hasattr(chunk, 'content'):
+                response_text += chunk.content
+        
+        response_preview = response_text[:50] + "..." if len(response_text) > 50 else response_text
+        print(f"[DEBUG] Q{question_num} API response received: {response_preview}")
+        
+        # Parse JSON response
+        result = {}
+        try:
+            import re
+            json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                result = json.loads(response_text.strip())
+        except json.JSONDecodeError:
+            # Fallback response
+            result = {
+                f"score{question_num}": 5,
+                f"feedback{question_num}": f"Grading feedback: {response_text[:200]}..." if response_text else "No feedback available"
+            }
+        
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] Q{question_num} API call failed: {e}")
+        return {
+            f"score{question_num}": 5,
+            f"feedback{question_num}": f"Error grading question {question_num}: {str(e)}"
+        }
+
+
+def run_grading(exec_id: str, sid: str, answers: Dict[str, str]) -> Dict[str, Any]:
+    """Legacy function - now calls the optimized version."""
+    return run_grading_streaming(exec_id, sid, answers)
+
+
+def run_evaluation_streaming(grade_res: Dict[str, Any]) -> Dict[str, Any]:
+    """Optimized evaluation with streaming."""
+    try:
+        # Try to get prompt from Google Docs first
+        doc_id = PROMPT_DOC_IDS.get("evaluation")
+        prompt_name = PROMPT_NAMES.get("evaluation")
+        
+        if doc_id and doc_id != "YOUR_EVALUATION_PROMPT_DOC_ID":
+            prompt_template = prompt_manager.get_cached_prompt(doc_id, prompt_name)
+        else:
+            prompt_template = get_default_prompts()["evaluation_prompt"]
+        
+        if not prompt_template:
+            prompt_template = get_default_prompts()["evaluation_prompt"]
+        
+        # Format the prompt with actual data
+        prompt = prompt_template.format(
+            execution_id=grade_res.get('execution_id', ''),
+            student_id=grade_res.get('student_id', ''),
+            previous_grading=json.dumps(grade_res, indent=2)
+        )
+
+        # Use streaming for faster response
+        response_text = ""
+        start_time = time.time()
+        with st.spinner("Evaluating feedback..."):
+            for chunk in agent.stream(prompt):
+                if hasattr(chunk, 'content'):
+                    response_text += chunk.content
+        
+        eval_time = time.time() - start_time
+        response_preview = response_text[:50] + "..." if len(response_text) > 50 else response_text
+        print(f"[BENCHMARK] Evaluation completed in {eval_time:.3f}s")
+        print(f"[DEBUG] run_evaluation_streaming LLM response: {response_preview}")
+        
+        # Improved JSON parsing with multiple fallback strategies
+        result = {}
+        try:
+            import re
+            # Strategy 1: Look for JSON object with simpler pattern
+            json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                # Strategy 2: Look for JSON array
+                json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    # Strategy 3: Try to parse the entire response as JSON
+                    result = json.loads(response_text.strip())
+        except json.JSONDecodeError:
+            # Strategy 4: If all JSON parsing fails, try to extract fields manually
+            print("[WARNING] Could not parse JSON from evaluation response, attempting manual extraction")
+            result = {
+                "execution_id": grade_res.get('execution_id', ''),
+                "student_id": grade_res.get('student_id', ''),
+                "new_score1": grade_res.get('score1', 0),
+                "new_score2": grade_res.get('score2', 0),
+                "new_score3": grade_res.get('score3', 0),
+                "new_feedback1": grade_res.get('feedback1', ''),
+                "new_feedback2": grade_res.get('feedback2', ''),
+                "new_feedback3": grade_res.get('feedback3', '')
+            }
+            
+            # Try to extract individual feedback fields from the response text
+            try:
+                import re
+                # Look for new_feedback1, new_feedback2, new_feedback3 patterns
+                for i in range(1, 4):
+                    feedback_pattern = rf'"new_feedback{i}":\s*"([^"]*)"'
+                    score_pattern = rf'"new_score{i}":\s*(\d+)'
+                    
+                    feedback_match = re.search(feedback_pattern, response_text)
+                    score_match = re.search(score_pattern, response_text)
+                    
+                    if feedback_match:
+                        result[f"new_feedback{i}"] = feedback_match.group(1)
+                    if score_match:
+                        result[f"new_score{i}"] = int(score_match.group(1))
+                        
+            except Exception as e:
+                print(f"[WARNING] Manual extraction failed: {e}")
+                # Keep the original feedback as fallback
+        
+        print("[DEBUG] run_evaluation_streaming extracted:", result)
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] run_evaluation_streaming failed: {e}")
+        st.error(f"Evaluation failed: {e}")
+        return {}
+
+
+def run_evaluation(grade_res: Dict[str, Any]) -> Dict[str, Any]:
+    """Legacy function - now calls the optimized version."""
+    return run_evaluation_streaming(grade_res)
+
+
+def run_conversation_streaming(exec_id: str, sid: str, user_msg: str) -> Dict[str, Any]:
+    """Optimized conversation with streaming and context cache integration."""
+    try:
+        # Build context from cache system
+        q1_context = context_cache.get_question_context('1')
+        q2_context = context_cache.get_question_context('2')
+        q3_context = context_cache.get_question_context('3')
+        conversation_context = context_cache.get_conversation_context()
+        
+        # Combine all contexts
+        context_str = f"Question 1 Context:\n{q1_context}\n\nQuestion 2 Context:\n{q2_context}\n\nQuestion 3 Context:\n{q3_context}\n\nConversation History:\n{conversation_context}"
+        
+        # Try to get prompt from Google Docs first
+        doc_id = PROMPT_DOC_IDS.get("conversation")
+        prompt_name = PROMPT_NAMES.get("conversation")
+        
+        if doc_id and doc_id != "YOUR_CONVERSATION_PROMPT_DOC_ID":
+            prompt_template = prompt_manager.get_cached_prompt(doc_id, prompt_name)
+        else:
+            prompt_template = get_default_prompts()["conversation_prompt"]
+        
+        if not prompt_template:
+            prompt_template = get_default_prompts()["conversation_prompt"]
+        
+        # Format the prompt with context-aware data
+        prompt = prompt_template.format(
+            context=context_str,
+            user_question=user_msg
+        )
+
+        # Use streaming for faster response
+        response_text = ""
+        start_time = time.time()
+        with st.spinner("Processing your question..."):
+            for chunk in agent.stream(prompt):
+                if hasattr(chunk, 'content'):
+                    response_text += chunk.content
+        
+        conv_time = time.time() - start_time
+        response_preview = response_text[:50] + "..." if len(response_text) > 50 else response_text
+        print(f"[BENCHMARK] Conversation completed in {conv_time:.3f}s")
+        print(f"[DEBUG] run_conversation_streaming LLM response: {response_preview}")
+        
+        result = {
+            "execution_id": exec_id,
+            "student_id": sid,
+            "user_msg": user_msg,
+            "agent_msg": response_text,
+            "timestamp": datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        }
+        
+        print("[DEBUG] run_conversation_streaming extracted:", result)
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] run_conversation_streaming failed: {e}")
+        st.error(f"Conversation failed: {e}")
+        return {
+            "execution_id": exec_id,
+            "student_id": sid,
+            "user_msg": user_msg,
+            "agent_msg": "I'm sorry, I'm having trouble processing your question right now. Please try again.",
+            "timestamp": datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        }
+
+
+def run_conversation(exec_id: str, sid: str, user_msg: str) -> Dict[str, Any]:
+    """Legacy function - now calls the optimized streaming version."""
+    return run_conversation_streaming(exec_id, sid, user_msg)
+
+# --- Legacy Context Gathering Functions Removed ---
+# These functions are no longer needed since we use the ContextCache system
+# which provides better performance and more structured context management
+
+# Main UI loop
+
+def main() -> None:
+    # Handle scroll to top
+    if SCROLL_AVAILABLE and st.session_state.get('scroll_to_top', False):
+        scroll_to_here(0, key='scroll_to_top')
+        st.session_state['scroll_to_top'] = False
+    
+    
+    # --- Main container for app ---
+    with st.container():
+        sid = prompt_student_id()
+        if not sid:
+            return
+
+        sa = load_assignment(sid)
+        if not sa:
+            return
+        aid = sa['assignment_id']
+
+        qrec = load_questions(aid)
+        if not qrec:
+            return
+
+        # Ensure exec_id is generated once per assignment session
+        if 'exec_id' not in st.session_state:
+            st.session_state['exec_id'] = str(uuid.uuid4())
+        exec_id = st.session_state['exec_id']
+        
+        # Initialize question caches with question text
+        context_cache.initialize_question_cache('1', qrec.get('Question1', ''))
+        context_cache.initialize_question_cache('2', qrec.get('Question2', ''))
+        context_cache.initialize_question_cache('3', qrec.get('Question3', ''))
+        round_no = st.session_state.get('round', 1)
+        st.markdown(f"<h3 style='margin-top:0.2rem; margin-bottom:0.7rem; font-size:1.08rem;'>📝 Round {round_no}</h3>", unsafe_allow_html=True)
+
+        answers: dict[str, str] = {}
+        fb = st.session_state.get('feedback')
+        submitted = st.session_state.get('submitted', False)
+        reset_counter = st.session_state.get('reset_counter', 0)
+        
+        print(f"[DEBUG] Main function - fb exists: {bool(fb)}, submitted: {submitted}")
+
+        # --- Questions and Answers (single column) ---
+        for i in range(1, 4):
+            st.markdown(f"<div class='question-card' style='margin-bottom:0.3rem; font-size:1.08rem;'><b>Q{i}:</b> {qrec.get(f'Question{i}', '')}</div>", unsafe_allow_html=True)
+            key = f'a{i}_r{round_no}_reset{reset_counter}'
+            val_key = f'q{i}_val'
+            answers[f'q{i}'] = st.text_area("Your Answer", value=st.session_state.get(val_key, ''), key=key, on_change=None)
+            st.session_state[val_key] = answers[f'q{i}']
+            # After submission, show feedback/score under each answer
+            if fb and submitted:
+                score = fb.get(f'new_score{i}', fb.get(f'score{i}', 0))
+                text = fb.get(f'new_feedback{i}', fb.get(f'feedback{i}', ''))
+                try:
+                    score = float(score) if score else 0
+                except (ValueError, TypeError):
+                    score = 0
+                if score >= THRESHOLD_SCORE:
+                    score_class = 'score-high'
+                    emoji = '✅'
+                elif score >= THRESHOLD_SCORE - 2:
+                    score_class = 'score-mid'
+                    emoji = '⚠️'
+                else:
+                    score_class = 'score-low'
+                    emoji = '❌'
+                st.markdown(f"""
+                    <div class='feedback-score-card' style='background:rgba(180,255,80,0.18); color:#fff; border-radius:8px 8px 0 0; padding:1rem; margin-bottom:0; font-size:1.08rem;'>
+                        <span class='{score_class}'>{emoji} Score: {score}/10</span>
+                    </div>
+                """, unsafe_allow_html=True)
+                if text:
+                    st.markdown(
+                        f"""
+                        <div style='background:rgba(180,255,80,0.18); color:#fff; border-radius:0 0 8px 8px; padding:1rem; margin-bottom:0.7rem; font-size:1.08rem; margin-top:0;'>
+                            <b>Feedback:</b><br>{text}
+                        </div>
+                        """, unsafe_allow_html=True
+                    )
+                else:
+                    st.info(f"No feedback available for Q{i}")
+
+        # --- Submission logic ---
+        st.markdown("<div style='height:1.2rem;'></div>", unsafe_allow_html=True)
+        fb = st.session_state.get('feedback')
+        awaiting_resubmit = st.session_state.get('awaiting_resubmit', False)
+        
+        if not fb and not awaiting_resubmit:
+            # Define callback function for submission
+            def handle_submit():
+                # Prevent submission if any answer is empty
+                if any(not answers[f'q{i}'].strip() for i in range(1, 4)):
+                    st.session_state['submit_error'] = 'Please fill in all answers before submitting.'
+                    return
+                
+                # Process submission
+                with st.spinner('Submitting your answers...'):
+                    record_answers(exec_id, sid, aid, answers)
+                    grade_res = run_grading(exec_id, sid, answers)
+                    if grade_res:
+                        # Queue grading data for background writing
+                        background_writer.write_async('grading', grade_res)
+                        
+                        # Populate context cache with responses and feedback
+                        for i in range(1, 4):
+                            response = answers.get(f'q{i}', '')
+                            feedback = grade_res.get(f'feedback{i}', '')
+                            score = grade_res.get(f'score{i}', '')
+                            context_cache.add_response_and_feedback(str(i), response, feedback, score)
+                        
+                        # Store in session state for the rest of the app
+                        st.session_state['feedback'] = grade_res
+                        st.session_state['submitted'] = True
+                        st.session_state['awaiting_resubmit'] = False
+                        st.session_state['submit_error'] = None
+                    else:
+                        st.session_state['submit_error'] = 'Failed to grade your answers. Please try again.'
+            
+            # Show Submit Answers button with callback
+            submit = st.button('Submit Answers', use_container_width=True, on_click=handle_submit)
+            
+            # Show any submission errors
+            if st.session_state.get('submit_error'):
+                st.error(st.session_state['submit_error'])
+        # --- Completion/Follow-up logic ---
+        if fb:
+            st.markdown("<div style='height:0.7rem;'></div>", unsafe_allow_html=True)
+            scores = [float(fb.get(f'new_score{i}', fb.get(f'score{i}', 0))) for i in range(1, 4)]
+            if all(score >= THRESHOLD_SCORE for score in scores):
+                st.success('🎉 You have successfully completed this assignment!')
+            else:
+                st.warning(f'You need scores of {THRESHOLD_SCORE} or higher on all questions to complete this assignment.')
+                # If awaiting_resubmit, show resubmit button above conversation
+                if awaiting_resubmit:
+                    resubmit = st.button('Resubmit', key='resubmit_btn', use_container_width=True)
+                    if resubmit:
+                        # Submit new answers
+                        if any(not answers[f'q{i}'].strip() for i in range(1, 4)):
+                            st.toast('Please fill in all answers before resubmitting.', icon='⚠️')
+                        else:
+                            with st.spinner('Submitting your answers...'):
+                                record_answers(exec_id, sid, aid, answers)
+                                grade_res = run_grading(exec_id, sid, answers)
+                                if grade_res:
+                                    sheets.grading.append_row(grade_res)
+                                    # Skip evaluation for faster response - use grading directly
+                                    st.session_state['feedback'] = grade_res
+                                    st.session_state['submitted'] = True
+                                    st.session_state['awaiting_resubmit'] = False
+                                else:
+                                    st.error("Failed to grade your answers. Please try again.")
+                            rerun()
+                # Add enhanced feedback button
+                col1, col2 = st.columns(2)
+                with col1:
+                    enhanced_feedback = st.button('Get Enhanced Feedback', key='enhanced_feedback_btn')
+                    if enhanced_feedback:
+                        with st.spinner('Getting enhanced feedback...'):
+                            eval_res = run_evaluation(fb)
+                            if eval_res:
+                                # Queue evaluation data for background writing
+                                background_writer.write_async('evaluation', eval_res)
+                                st.session_state['feedback'] = eval_res
+                                st.success('Enhanced feedback generated!')
+                                rerun()
+                            else:
+                                st.error("Failed to get enhanced feedback.")
+                
+                with col2:
+                    # Use a counter-based key to force clearing
+                    conv_counter = st.session_state.get('conv_counter', 0)
+                    user_q = st.text_input('Ask a follow-up question:', key=f'conv_{conv_counter}')
+                
+                # Only process if there's a new question and it hasn't been processed yet
+                if user_q and user_q != st.session_state.get('last_processed_question', ''):
+                    try:
+                        conv_res = run_conversation(exec_id, sid, user_q)
+                        if conv_res:
+                            # Queue conversation data for background writing
+                            background_writer.write_async('conversations', conv_res)
+                            agent_msg = conv_res.get('agent_msg', conv_res.get('content', 'No response available'))
+                            
+                            # Add to conversation cache
+                            context_cache.add_conversation(user_q, agent_msg)
+                            
+                            # Store the response in session state to persist it
+                            st.session_state['last_conversation_response'] = agent_msg
+                            
+                            # Mark this question as processed and increment counter to clear input
+                            st.session_state['last_processed_question'] = user_q
+                            st.session_state['conv_counter'] = conv_counter + 1
+                            
+                            # Show success message and trigger rerun to clear input
+                            st.success("Response generated!")
+                            rerun()
+                        else:
+                            st.error("Failed to get a response. Please try again.")
+                    except Exception as e:
+                        st.error(f"Error during conversation: {e}")
+                
+                # Display the stored conversation response
+                if st.session_state.get('last_conversation_response'):
+                    st.write("**AI Response:**")
+                    st.write(st.session_state['last_conversation_response'])
+                # Show Retry button at the bottom if not awaiting_resubmit
+                if not awaiting_resubmit:
+                    retry = st.button('Retry', key='retry_btn', use_container_width=True)
+                    if retry:
+                        # Set retry mode to show new question blocks below
+                        st.session_state['retry_mode'] = True
+                        st.session_state['retry_counter'] = st.session_state.get('retry_counter', 0) + 1
+                        
+                        # Auto-scroll to retry section
+                        if SCROLL_AVAILABLE:
+                            st.session_state['scroll_to_retry'] = True
+                        
+                        rerun()
+
+        # --- Retry Mode: Show new question blocks below everything ---
+        if st.session_state.get('retry_mode', False):
+            # Place scroll anchor at the beginning of retry section
+            if SCROLL_AVAILABLE and st.session_state.get('scroll_to_retry', False):
+                scroll_to_here(0, key='retry_section_anchor')
+                st.session_state['scroll_to_retry'] = False
+            
+            st.markdown("<div style='height:2rem;'></div>", unsafe_allow_html=True)
+            st.markdown("---")
+            st.markdown(f"<h2 style='text-align: center; margin-bottom: 1.5rem;'>🔄 Retry Assignment</h2>", unsafe_allow_html=True)
+            st.markdown(f"<p style='text-align: center; color: #666; margin-bottom: 2rem;'>Fill in your new answers below and click Resubmit when ready.</p>", unsafe_allow_html=True)
+            
+            retry_answers: dict[str, str] = {}
+            
+            # Show retry question blocks
+            for i in range(1, 4):
+                st.markdown(f"<div class='question-card' style='margin-bottom:0.3rem; font-size:1.08rem;'><b>Q{i}:</b> {qrec.get(f'Question{i}', '')}</div>", unsafe_allow_html=True)
+                retry_key = f'retry_a{i}_counter{st.session_state.get("retry_counter", 0)}'
+                retry_val_key = f'retry_q{i}_val'
+                retry_answers[f'q{i}'] = st.text_area("Your New Answer", value=st.session_state.get(retry_val_key, ''), key=retry_key, on_change=None)
+                st.session_state[retry_val_key] = retry_answers[f'q{i}']
+            
+            # Retry submission buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                retry_submit = st.button('Resubmit New Answers', key='retry_submit_btn', use_container_width=True)
+            with col2:
+                cancel_retry = st.button('Cancel Retry', key='cancel_retry_btn', use_container_width=True)
+            
+            if retry_submit:
+                # Prevent submission if any answer is empty
+                if any(not retry_answers[f'q{i}'].strip() for i in range(1, 4)):
+                    st.toast('Please fill in all answers before resubmitting.', icon='⚠️')
+                else:
+                    with st.spinner('Submitting your new answers...'):
+                        # Record new answers
+                        record_answers(exec_id, sid, aid, retry_answers)
+                        # Grade new answers
+                        grade_res = run_grading(exec_id, sid, retry_answers)
+                        if grade_res:
+                            # Queue grading data for background writing
+                            background_writer.write_async('grading', grade_res)
+                            
+                            # Populate context cache with retry responses and feedback
+                            for i in range(1, 4):
+                                response = retry_answers.get(f'q{i}', '')
+                                feedback = grade_res.get(f'feedback{i}', '')
+                                score = grade_res.get(f'score{i}', '')
+                                context_cache.add_response_and_feedback(str(i), response, feedback, score)
+                            
+                            # FIX 1: Replace text in answer boxes at the top with new answers
+                            for i in range(1, 4):
+                                st.session_state[f'q{i}_val'] = retry_answers[f'q{i}']
+                            
+                            # FIX 2: Erase any conversation text and reset conversation state
+                            st.session_state['conversation_text'] = ''
+                            st.session_state['last_processed_question'] = ''
+                            st.session_state['conv_counter'] = 0
+                            st.session_state['last_conversation_response'] = ''
+                            
+                            # Clear retry mode and reset to show new feedback
+                            st.session_state['retry_mode'] = False
+                            st.session_state['feedback'] = grade_res
+                            st.session_state['submitted'] = True
+                            st.session_state['awaiting_resubmit'] = False
+                            
+                            # Clear retry answer values
+                            for i in range(1, 4):
+                                st.session_state[f'retry_q{i}_val'] = ''
+                            
+                            # FIX 3: Trigger scroll to top
+                            if SCROLL_AVAILABLE:
+                                st.session_state['scroll_to_top'] = True
+                            
+                            st.success('New answers submitted successfully!')
+                            rerun()
+                        else:
+                            st.error("Failed to grade your new answers. Please try again.")
+            
+            if cancel_retry:
+                # Clear retry mode
+                st.session_state['retry_mode'] = False
+                # Clear retry answer values
+                for i in range(1, 4):
+                    st.session_state[f'retry_q{i}_val'] = ''
+                rerun()
+
+    # --- Footer ---
+    st.markdown("""
+    <div class='footer'>
+        <span>&middot; <a href='https://github.com/mudcario350/streamlitapp' target='_blank'>GitHub</a></span>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Launch with guaranteed write completion
+def run_app():
+    """Run the app with proper cleanup."""
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 App interrupted by user")
+    except Exception as e:
+        print(f"❌ App error: {e}")
+    finally:
+        print("🔄 Ensuring all writes complete before shutdown...")
+        try:
+            background_writer.shutdown()
+            print("✅ All writes completed successfully")
+        except Exception as e:
+            print(f"⚠️ Error during shutdown: {e}")
+
+# Run the app
+run_app()
+
