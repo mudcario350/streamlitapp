@@ -1423,7 +1423,7 @@ def main() -> None:
         sa = load_assignment(sid)
         if not sa:
             return
-        aid = sa['assignment_id']
+        aid = str(sa['assignment_id'])
 
         qrec = load_questions(aid)
         if not qrec:
