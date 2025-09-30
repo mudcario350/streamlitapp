@@ -999,10 +999,18 @@ def _make_single_api_call(question_num: int, prompt: str) -> Dict[str, Any]:
             else:
                 result = json.loads(response_text.strip())
         except json.JSONDecodeError:
-            # Fallback response
+            # Fallback response - clean up any JSON artifacts
+            clean_feedback = response_text
+            # Remove common JSON artifacts
+            clean_feedback = re.sub(r'```json\s*', '', clean_feedback)
+            clean_feedback = re.sub(r'```\s*', '', clean_feedback)
+            clean_feedback = re.sub(r'\{[^}]*\}', '', clean_feedback)  # Remove JSON objects
+            clean_feedback = re.sub(r'"[^"]*":\s*"[^"]*"', '', clean_feedback)  # Remove key-value pairs
+            clean_feedback = clean_feedback.strip()
+            
             result = {
                 f"score{question_num}": 5,
-                f"feedback{question_num}": f"Grading feedback: {response_text[:200]}..." if response_text else "No feedback available"
+                f"feedback{question_num}": clean_feedback[:300] + "..." if len(clean_feedback) > 300 else clean_feedback if clean_feedback else "No feedback available"
             }
         
         return result
