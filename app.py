@@ -810,21 +810,31 @@ def load_previous_session_data(student_id: str, assignment_id: str) -> tuple[Dic
         all_grading = sheets.get_all_grading_for_memory(student_id, assignment_id)
         all_conversations = sheets.get_all_conversations_for_memory(student_id, assignment_id)
         
-        # Find the most recent records for UI display
+        # Find the most recent answers record
         latest_answers = {}
-        latest_grading = {}
-        latest_conversation = {}
-        
         if all_answers:
             latest_answers = max(all_answers, key=lambda x: x.get("timestamp", ""))
-        if all_grading:
-            latest_grading = max(all_grading, key=lambda x: x.get("timestamp", ""))
+            print(f"[DEBUG] Latest answers record: {latest_answers}")
+        
+        # Find the matching feedback record with the same execution_id
+        matching_feedback = {}
+        if latest_answers and all_grading:
+            execution_id = latest_answers.get("execution_id")
+            print(f"[DEBUG] Looking for feedback with execution_id: {execution_id}")
+            
+            for grading_record in all_grading:
+                if grading_record.get("execution_id") == execution_id:
+                    matching_feedback = grading_record
+                    print(f"[DEBUG] Found matching feedback record: {matching_feedback}")
+                    break
+        
+        # Find the most recent conversation record
+        latest_conversation = {}
         if all_conversations:
             latest_conversation = max(all_conversations, key=lambda x: x.get("timestamp", ""))
         
         # Prepare previous answers for UI
         previous_answers = {}
-        print(f"[DEBUG] Latest answers record: {latest_answers}")
         for i in range(1, 4):
             answer_key = f"q{i}_answer"  # Use correct column name from Google Sheet
             ui_key = f"q{i}"  # Use q1, q2, q3 for UI
@@ -839,10 +849,10 @@ def load_previous_session_data(student_id: str, assignment_id: str) -> tuple[Dic
         
         print(f"[SESSION RESTORE] Found {len(all_answers)} answer records, {len(all_grading)} grading records, {len(all_conversations)} conversation records")
         print(f"[SESSION RESTORE] Previous answers: {previous_answers}")
-        print(f"[SESSION RESTORE] Latest grading: {latest_grading}")
+        print(f"[SESSION RESTORE] Matching feedback: {matching_feedback}")
         print(f"[SESSION RESTORE] Latest conversation response: {latest_conversation_response[:100]}..." if latest_conversation_response else "[SESSION RESTORE] No conversation response")
         
-        return previous_answers, latest_grading, latest_conversation_response
+        return previous_answers, matching_feedback, latest_conversation_response
         
     except Exception as e:
         print(f"[ERROR] Failed to load previous session data: {e}")
