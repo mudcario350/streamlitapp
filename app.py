@@ -833,6 +833,9 @@ def load_previous_session_data(student_id: str, assignment_id: str) -> tuple[Dic
         latest_conversation_response = latest_conversation.get("agent_msg", "") if latest_conversation else ""
         
         print(f"[SESSION RESTORE] Found {len(all_answers)} answer records, {len(all_grading)} grading records, {len(all_conversations)} conversation records")
+        print(f"[SESSION RESTORE] Previous answers: {previous_answers}")
+        print(f"[SESSION RESTORE] Latest grading: {latest_grading}")
+        print(f"[SESSION RESTORE] Latest conversation response: {latest_conversation_response[:100]}..." if latest_conversation_response else "[SESSION RESTORE] No conversation response")
         
         return previous_answers, latest_grading, latest_conversation_response
         
@@ -1471,6 +1474,9 @@ def main() -> None:
         reset_counter = st.session_state.get('reset_counter', 0)
         
         print(f"[DEBUG] Main function - fb exists: {bool(fb)}, submitted: {submitted}")
+        print(f"[DEBUG] Previous answers: {previous_answers}")
+        print(f"[DEBUG] Previous feedback: {previous_feedback}")
+        print(f"[DEBUG] Latest conversation response: {latest_conversation_response[:100]}..." if latest_conversation_response else "[DEBUG] No conversation response")
         
         # Debug: Show memory system status
         if assignment_memory.current_state:
@@ -1490,6 +1496,7 @@ def main() -> None:
             
             # Use previous answer if available, otherwise use session state
             default_value = previous_answers.get(f'q{i}', st.session_state.get(val_key, ''))
+            print(f"[DEBUG] Q{i} default_value: {default_value[:50]}..." if default_value else f"[DEBUG] Q{i} default_value: (empty)")
             answers[f'q{i}'] = st.text_area("Your Answer", value=default_value, key=key, on_change=None)
             st.session_state[val_key] = answers[f'q{i}']
             # After submission, show feedback/score under each answer
