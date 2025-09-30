@@ -1468,9 +1468,20 @@ def main() -> None:
         st.markdown(f"<h3 style='margin-top:0.2rem; margin-bottom:0.7rem; font-size:1.08rem;'>📝 Round {round_no}</h3>", unsafe_allow_html=True)
 
         answers: dict[str, str] = {}
-        # Use previous feedback if available, otherwise use session state
-        fb = previous_feedback if previous_feedback else st.session_state.get('feedback')
-        submitted = st.session_state.get('submitted', False) or bool(previous_feedback)
+        # If we have previous feedback, populate session state with it
+        if previous_feedback:
+            st.session_state['feedback'] = previous_feedback
+            st.session_state['submitted'] = True
+            print(f"[DEBUG] Feedback populated from previous session: {previous_feedback}")
+        
+        # If we have a previous conversation response, populate session state with it
+        if latest_conversation_response:
+            st.session_state['last_conversation_response'] = latest_conversation_response
+            print(f"[DEBUG] Conversation response populated from previous session: {latest_conversation_response[:100]}...")
+        
+        # Use session state feedback (which now contains previous feedback if available)
+        fb = st.session_state.get('feedback')
+        submitted = st.session_state.get('submitted', False)
         reset_counter = st.session_state.get('reset_counter', 0)
         
         print(f"[DEBUG] Main function - fb exists: {bool(fb)}, submitted: {submitted}")
@@ -1494,10 +1505,15 @@ def main() -> None:
             key = f'a{i}_r{round_no}_reset{reset_counter}'
             val_key = f'q{i}_val'
             
-            # Use previous answer if available, otherwise use session state
-            default_value = previous_answers.get(f'q{i}', st.session_state.get(val_key, ''))
-            print(f"[DEBUG] Q{i} default_value: {default_value[:50]}..." if default_value else f"[DEBUG] Q{i} default_value: (empty)")
-            answers[f'q{i}'] = st.text_area("Your Answer", value=default_value, key=key, on_change=None)
+            # If we have previous answers, populate session state with them
+            if previous_answers and f'q{i}' in previous_answers:
+                st.session_state[val_key] = previous_answers[f'q{i}']
+                print(f"[DEBUG] Q{i} populated from previous session: {previous_answers[f'q{i}'][:50]}...")
+            
+            # Use session state value (which now contains previous answer if available)
+            current_value = st.session_state.get(val_key, '')
+            print(f"[DEBUG] Q{i} current_value: {current_value[:50]}..." if current_value else f"[DEBUG] Q{i} current_value: (empty)")
+            answers[f'q{i}'] = st.text_area("Your Answer", value=current_value, key=key, on_change=None)
             st.session_state[val_key] = answers[f'q{i}']
             # After submission, show feedback/score under each answer
             if fb and submitted:
