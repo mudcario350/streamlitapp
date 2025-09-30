@@ -1506,6 +1506,11 @@ def main() -> None:
         submitted = st.session_state.get('submitted', False)
         reset_counter = st.session_state.get('reset_counter', 0)
         
+        # Clear retry completion flag if it exists
+        if st.session_state.get('retry_completed', False):
+            st.session_state['retry_completed'] = False
+            print("[RETRY] Cleared retry_completed flag")
+        
         print(f"[DEBUG] Main function - fb exists: {bool(fb)}, submitted: {submitted}")
         print(f"[DEBUG] Previous answers: {previous_answers}")
         print(f"[DEBUG] Previous feedback: {previous_feedback}")
@@ -1801,12 +1806,16 @@ def main() -> None:
                             for i in range(1, 4):
                                 st.session_state[f'retry_q{i}_val'] = ''
                             
-                            # FIX 3: Trigger scroll to top
+                            # FIX 3: Force a complete rerun to ensure updates are visible
+                            st.session_state['retry_completed'] = True
+                            st.session_state['reset_counter'] = st.session_state.get('reset_counter', 0) + 1
+                            
+                            # FIX 4: Trigger scroll to top
                             if SCROLL_AVAILABLE:
                                 st.session_state['scroll_to_top'] = True
                             
                             st.success('New answers submitted successfully!')
-                            rerun()
+                            st.rerun()
                         else:
                             st.error("Failed to grade your new answers. Please try again.")
             
