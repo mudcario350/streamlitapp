@@ -436,7 +436,7 @@ class StudentAssignmentsSheet(Sheet):
     def __init__(self, client):
         super().__init__(client, "student_assignments", [
             "student_id", "student_first_name", "student_last_name",
-            "assignment_id", "assignment_due"
+            "assignment_id", "assignment_due", "started"
         ])
 
     def fetch_current(self, student_id: str) -> dict[str, Any]:
@@ -484,6 +484,116 @@ class DataSheets:
             "execution_id", "assignment_id", "student_id",
             "user_msg", "agent_msg", "timestamp"
         ])
+    
+    def get_latest_answers(self, student_id: str, assignment_id: str) -> dict[str, Any]:
+        """Get the most recent answers for a student and assignment."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        latest_record = {}
+        latest_timestamp = None
+        
+        for rec in self.answers.get_all():
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                timestamp_str = rec.get("timestamp", "")
+                if timestamp_str and (latest_timestamp is None or timestamp_str > latest_timestamp):
+                    latest_timestamp = timestamp_str
+                    latest_record = rec
+        
+        return latest_record
+    
+    def get_all_answers_for_memory(self, student_id: str, assignment_id: str) -> List[dict[str, Any]]:
+        """Get all answers for a student and assignment for memory loading."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        all_answers = []
+        
+        for rec in self.answers.get_all():
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                all_answers.append(rec)
+        
+        # Sort by timestamp to maintain chronological order
+        all_answers.sort(key=lambda x: x.get("timestamp", ""))
+        return all_answers
+    
+    def get_latest_grading(self, student_id: str, assignment_id: str) -> dict[str, Any]:
+        """Get the most recent grading for a student and assignment."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        latest_record = {}
+        latest_timestamp = None
+        
+        for rec in self.grading.get_all():
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                timestamp_str = rec.get("timestamp", "")
+                if timestamp_str and (latest_timestamp is None or timestamp_str > latest_timestamp):
+                    latest_timestamp = timestamp_str
+                    latest_record = rec
+        
+        return latest_record
+    
+    def get_all_grading_for_memory(self, student_id: str, assignment_id: str) -> List[dict[str, Any]]:
+        """Get all grading records for a student and assignment for memory loading."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        all_grading = []
+        
+        for rec in self.grading.get_all():
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                all_grading.append(rec)
+        
+        # Sort by timestamp to maintain chronological order
+        all_grading.sort(key=lambda x: x.get("timestamp", ""))
+        return all_grading
+    
+    def get_latest_conversation(self, student_id: str, assignment_id: str) -> dict[str, Any]:
+        """Get the most recent conversation for a student and assignment."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        latest_record = {}
+        latest_timestamp = None
+        
+        for rec in self.conversations.get_all():
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                timestamp_str = rec.get("timestamp", "")
+                if timestamp_str and (latest_timestamp is None or timestamp_str > latest_timestamp):
+                    latest_timestamp = timestamp_str
+                    latest_record = rec
+        
+        return latest_record
+    
+    def get_all_conversations_for_memory(self, student_id: str, assignment_id: str) -> List[dict[str, Any]]:
+        """Get all conversations for a student and assignment for memory loading."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        all_conversations = []
+        
+        for rec in self.conversations.get_all():
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                all_conversations.append(rec)
+        
+        # Sort by timestamp to maintain chronological order
+        all_conversations.sort(key=lambda x: x.get("timestamp", ""))
+        return all_conversations
+    
+    def update_started_status(self, student_id: str, assignment_id: str, started: str):
+        """Update the started status for a student assignment."""
+        sid = student_id.strip()
+        aid = assignment_id.strip()
+        
+        # Find the row to update
+        for i, rec in enumerate(self.student_assignments.get_all()):
+            if (str(rec.get("student_id", "")).strip() == sid and 
+                str(rec.get("assignment_id", "")).strip() == aid):
+                # Update the started field
+                row_num = i + 2  # +2 because sheets are 1-indexed and we have a header row
+                self.student_assignments.ws.update_cell(row_num, 6, started)  # Column 6 is "started"
+                break
 
 # Initialize sheets
 @st.cache_resource(show_spinner="Loading...")
@@ -685,6 +795,64 @@ def get_assignment_memory_manager():
     return AssignmentMemoryManager()
 
 assignment_memory = get_assignment_memory_manager()
+
+def load_previous_session_data(student_id: str, assignment_id: str, questions: Dict[str, str]) -> tuple[Dict[str, str], Dict[str, Any], str]:
+    """
+    Load previous session data for a student and assignment.
+    Returns: (previous_answers, previous_feedback, latest_conversation_response)
+    """
+    try:
+        # Get all previous data for memory loading
+        all_answers = sheets.get_all_answers_for_memory(student_id, assignment_id)
+        all_grading = sheets.get_all_grading_for_memory(student_id, assignment_id)
+        all_conversations = sheets.get_all_conversations_for_memory(student_id, assignment_id)
+        
+        # Load all answers and feedback into memory
+        for answer_record in all_answers:
+            for i in range(1, 4):
+                answer_key = f"q{i}"
+                if answer_key in answer_record and answer_record[answer_key]:
+                    assignment_memory.add_student_answer(str(i), answer_record[answer_key])
+        
+        for grading_record in all_grading:
+            for i in range(1, 4):
+                score_key = f"score{i}"
+                feedback_key = f"feedback{i}"
+                if score_key in grading_record and feedback_key in grading_record:
+                    score = grading_record[score_key]
+                    feedback = grading_record[feedback_key]
+                    if score and feedback:
+                        assignment_memory.add_grading_result(str(i), int(score) if str(score).isdigit() else 0, feedback)
+        
+        # Load all conversations into memory
+        for conv_record in all_conversations:
+            user_msg = conv_record.get("user_msg", "")
+            agent_msg = conv_record.get("agent_msg", "")
+            if user_msg and agent_msg:
+                assignment_memory.add_conversation(user_msg, agent_msg)
+        
+        # Get the most recent data for UI display
+        latest_answers = sheets.get_latest_answers(student_id, assignment_id)
+        latest_grading = sheets.get_latest_grading(student_id, assignment_id)
+        latest_conversation = sheets.get_latest_conversation(student_id, assignment_id)
+        
+        # Prepare previous answers for UI
+        previous_answers = {}
+        for i in range(1, 4):
+            answer_key = f"q{i}"
+            if answer_key in latest_answers:
+                previous_answers[answer_key] = latest_answers[answer_key]
+        
+        # Get latest conversation response for UI
+        latest_conversation_response = latest_conversation.get("agent_msg", "") if latest_conversation else ""
+        
+        print(f"[SESSION RESTORE] Loaded {len(all_answers)} answer records, {len(all_grading)} grading records, {len(all_conversations)} conversation records")
+        
+        return previous_answers, latest_grading, latest_conversation_response
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to load previous session data: {e}")
+        return {}, {}, ""
 
 # Backward compatibility wrapper for existing code
 class ContextCache:
@@ -1230,6 +1398,29 @@ def main() -> None:
             st.session_state['exec_id'] = str(uuid.uuid4())
         exec_id = st.session_state['exec_id']
         
+        # Check if assignment has been started and load previous session data if needed
+        started_status = sa.get('started', 'FALSE').upper()
+        has_previous_data = False
+        previous_answers = {}
+        previous_feedback = {}
+        latest_conversation_response = ""
+        
+        # Check if there's previous data (answers or conversations)
+        latest_answers = sheets.get_latest_answers(sid, aid)
+        latest_conversation = sheets.get_latest_conversation(sid, aid)
+        
+        if latest_answers or latest_conversation:
+            has_previous_data = True
+            print(f"[SESSION RESTORE] Found previous data for student {sid}, assignment {aid}")
+            
+            # Load all previous session data into memory
+            questions = {
+                'q1': qrec.get('Question1', ''),
+                'q2': qrec.get('Question2', ''),
+                'q3': qrec.get('Question3', '')
+            }
+            previous_answers, previous_feedback, latest_conversation_response = load_previous_session_data(sid, aid, questions)
+        
         # Initialize assignment session with new memory system
         if not assignment_memory.current_state:
             questions = {
@@ -1250,8 +1441,9 @@ def main() -> None:
         st.markdown(f"<h3 style='margin-top:0.2rem; margin-bottom:0.7rem; font-size:1.08rem;'>📝 Round {round_no}</h3>", unsafe_allow_html=True)
 
         answers: dict[str, str] = {}
-        fb = st.session_state.get('feedback')
-        submitted = st.session_state.get('submitted', False)
+        # Use previous feedback if available, otherwise use session state
+        fb = previous_feedback if previous_feedback else st.session_state.get('feedback')
+        submitted = st.session_state.get('submitted', False) or bool(previous_feedback)
         reset_counter = st.session_state.get('reset_counter', 0)
         
         print(f"[DEBUG] Main function - fb exists: {bool(fb)}, submitted: {submitted}")
@@ -1271,7 +1463,10 @@ def main() -> None:
             st.markdown(f"<div class='question-card' style='margin-bottom:0.3rem; font-size:1.08rem;'><b>Q{i}:</b> {qrec.get(f'Question{i}', '')}</div>", unsafe_allow_html=True)
             key = f'a{i}_r{round_no}_reset{reset_counter}'
             val_key = f'q{i}_val'
-            answers[f'q{i}'] = st.text_area("Your Answer", value=st.session_state.get(val_key, ''), key=key, on_change=None)
+            
+            # Use previous answer if available, otherwise use session state
+            default_value = previous_answers.get(f'q{i}', st.session_state.get(val_key, ''))
+            answers[f'q{i}'] = st.text_area("Your Answer", value=default_value, key=key, on_change=None)
             st.session_state[val_key] = answers[f'q{i}']
             # After submission, show feedback/score under each answer
             if fb and submitted:
@@ -1339,6 +1534,14 @@ def main() -> None:
                             
                             # Also add to backward compatibility cache
                             context_cache.add_response_and_feedback(str(i), response, feedback, score)
+                        
+                        # Update started status to TRUE if it was FALSE
+                        if started_status == 'FALSE':
+                            try:
+                                sheets.update_started_status(sid, aid, 'TRUE')
+                                print(f"[SESSION] Updated started status to TRUE for student {sid}, assignment {aid}")
+                            except Exception as e:
+                                print(f"[ERROR] Failed to update started status: {e}")
                         
                         # Store in session state for the rest of the app
                         st.session_state['feedback'] = grade_res
@@ -1431,10 +1634,11 @@ def main() -> None:
                     except Exception as e:
                         st.error(f"Error during conversation: {e}")
                 
-                # Display the stored conversation response
-                if st.session_state.get('last_conversation_response'):
+                # Display the stored conversation response (from session state or previous data)
+                conversation_response = st.session_state.get('last_conversation_response') or latest_conversation_response
+                if conversation_response:
                     st.write("**AI Response:**")
-                    st.write(st.session_state['last_conversation_response'])
+                    st.write(conversation_response)
                 # Show Retry button at the bottom if not awaiting_resubmit
                 if not awaiting_resubmit:
                     retry = st.button('Retry', key='retry_btn', use_container_width=True)
