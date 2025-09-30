@@ -468,7 +468,7 @@ class DataSheets:
         self.student_assignments = StudentAssignmentsSheet(client)
         self.answers = Sheet(client, "student_answers", [
             "execution_id", "assignment_id", "student_id",
-            "q1", "q2", "q3", "timestamp"
+            "q1_answer", "q2_answer", "q3_answer", "timestamp"
         ])
         self.grading = Sheet(client, "feedback+grading", [
             "execution_id", "assignment_id", "student_id",
@@ -824,10 +824,15 @@ def load_previous_session_data(student_id: str, assignment_id: str) -> tuple[Dic
         
         # Prepare previous answers for UI
         previous_answers = {}
+        print(f"[DEBUG] Latest answers record: {latest_answers}")
         for i in range(1, 4):
-            answer_key = f"q{i}"
+            answer_key = f"q{i}_answer"  # Use correct column name from Google Sheet
+            ui_key = f"q{i}"  # Use q1, q2, q3 for UI
             if answer_key in latest_answers:
-                previous_answers[answer_key] = latest_answers[answer_key]
+                previous_answers[ui_key] = latest_answers[answer_key]
+                print(f"[DEBUG] Found {answer_key}: {latest_answers[answer_key][:50]}..." if latest_answers[answer_key] else f"[DEBUG] Found {answer_key}: (empty)")
+            else:
+                print(f"[DEBUG] Missing {answer_key} in latest_answers")
         
         # Get latest conversation response for UI
         latest_conversation_response = latest_conversation.get("agent_msg", "") if latest_conversation else ""
@@ -859,7 +864,7 @@ def load_session_data_into_memory(student_id: str, assignment_id: str):
         # Load all answers and feedback into memory
         for answer_record in all_answers:
             for i in range(1, 4):
-                answer_key = f"q{i}"
+                answer_key = f"q{i}_answer"  # Use correct column name from Google Sheet
                 if answer_key in answer_record and answer_record[answer_key]:
                     assignment_memory.add_student_answer(str(i), answer_record[answer_key])
         
