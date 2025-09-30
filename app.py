@@ -1042,7 +1042,9 @@ def record_answers(exec_id: str, sid: str, aid: str, answers: dict[str, str]) ->
         'execution_id': exec_id,
         'assignment_id': aid,
         'student_id': sid,
-        **answers,
+        'q1_answer': answers.get('q1', ''),
+        'q2_answer': answers.get('q2', ''),
+        'q3_answer': answers.get('q3', ''),
         'timestamp': datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
     }
     # Queue for background writing instead of blocking
