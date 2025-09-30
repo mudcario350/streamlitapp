@@ -1490,11 +1490,13 @@ def main() -> None:
         st.markdown(f"<h3 style='margin-top:0.2rem; margin-bottom:0.7rem; font-size:1.08rem;'>📝 Round {round_no}</h3>", unsafe_allow_html=True)
 
         answers: dict[str, str] = {}
-        # If we have previous feedback, populate session state with it
-        if previous_feedback:
+        # If we have previous feedback AND no current session state feedback, populate session state with it
+        if previous_feedback and not st.session_state.get('feedback'):
             st.session_state['feedback'] = previous_feedback
             st.session_state['submitted'] = True
             print(f"[DEBUG] Feedback populated from previous session: {previous_feedback}")
+        elif st.session_state.get('feedback'):
+            print(f"[DEBUG] Using existing session state feedback: {st.session_state.get('feedback')}")
         
         # If we have a previous conversation response, populate session state with it
         if latest_conversation_response:
