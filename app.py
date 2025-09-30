@@ -1052,7 +1052,7 @@ def record_answers(exec_id: str, sid: str, aid: str, answers: dict[str, str]) ->
 # Removed grade_single_question function - now using _make_single_api_call for true parallelism
 
 
-def run_grading_streaming(exec_id: str, sid: str, answers: Dict[str, str]) -> Dict[str, Any]:
+def run_grading_streaming(exec_id: str, sid: str, aid: str, answers: Dict[str, str]) -> Dict[str, Any]:
     """True parallel grading - all API calls made simultaneously."""
     try:
         # Get contexts once
@@ -1143,6 +1143,7 @@ Be thoughtful in your evaluation. Consider clarity, depth of understanding, and 
         # Merge results from all three questions
         merged_result = {
             "execution_id": exec_id,
+            "assignment_id": aid,
             "student_id": sid,
             "score1": 0, "score2": 0, "score3": 0,
             "feedback1": "", "feedback2": "", "feedback3": ""
@@ -1237,9 +1238,9 @@ def _make_single_api_call(question_num: int, prompt: str) -> Dict[str, Any]:
         }
 
 
-def run_grading(exec_id: str, sid: str, answers: Dict[str, str]) -> Dict[str, Any]:
+def run_grading(exec_id: str, sid: str, aid: str, answers: Dict[str, str]) -> Dict[str, Any]:
     """Legacy function - now calls the optimized version."""
-    return run_grading_streaming(exec_id, sid, answers)
+    return run_grading_streaming(exec_id, sid, aid, answers)
 
 
 def run_evaluation_streaming(grade_res: Dict[str, Any]) -> Dict[str, Any]:
@@ -1579,7 +1580,7 @@ def main() -> None:
                 # Process submission
                 with st.spinner('Submitting your answers...'):
                     record_answers(exec_id, sid, aid, answers)
-                    grade_res = run_grading(exec_id, sid, answers)
+                    grade_res = run_grading(exec_id, sid, aid, answers)
                     if grade_res:
                         # Queue grading data for background writing
                         background_writer.write_async('grading', grade_res)
@@ -1637,7 +1638,7 @@ def main() -> None:
                         else:
                             with st.spinner('Submitting your answers...'):
                                 record_answers(exec_id, sid, aid, answers)
-                                grade_res = run_grading(exec_id, sid, answers)
+                                grade_res = run_grading(exec_id, sid, aid, answers)
                                 if grade_res:
                                     sheets.grading.append_row(grade_res)
                                     # Skip evaluation for faster response - use grading directly
@@ -1753,7 +1754,7 @@ def main() -> None:
                         # Record new answers
                         record_answers(exec_id, sid, aid, retry_answers)
                         # Grade new answers
-                        grade_res = run_grading(exec_id, sid, retry_answers)
+                        grade_res = run_grading(exec_id, sid, aid, retry_answers)
                         if grade_res:
                             # Queue grading data for background writing
                             background_writer.write_async('grading', grade_res)
