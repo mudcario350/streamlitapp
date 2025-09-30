@@ -1,6 +1,16 @@
+streamlit
+streamlit-scroll-to-top
 pandas
 altair
-openai==0.28.0
+openai>=1.58.1
 gspread
 google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+langchain-openai
+langchain-google-genai
+langchain-core
+langgraph
 python-dotenv
+google-generativeai
