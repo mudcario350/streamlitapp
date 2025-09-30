@@ -1527,12 +1527,12 @@ def main() -> None:
             key = f'a{i}_r{round_no}_reset{reset_counter}'
             val_key = f'q{i}_val'
             
-            # If we have previous answers, populate session state with them
-            if previous_answers and f'q{i}' in previous_answers:
+            # If we have previous answers AND no current session state value, populate session state with them
+            if previous_answers and f'q{i}' in previous_answers and not st.session_state.get(val_key):
                 st.session_state[val_key] = previous_answers[f'q{i}']
                 print(f"[DEBUG] Q{i} populated from previous session: {previous_answers[f'q{i}'][:50]}...")
             
-            # Use session state value (which now contains previous answer if available)
+            # Use session state value (which now contains previous answer if available, or retry answer if updated)
             current_value = st.session_state.get(val_key, '')
             print(f"[DEBUG] Q{i} current_value: {current_value[:50]}..." if current_value else f"[DEBUG] Q{i} current_value: (empty)")
             answers[f'q{i}'] = st.text_area("Your Answer", value=current_value, key=key, on_change=None)
