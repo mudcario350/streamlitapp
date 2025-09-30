@@ -1531,6 +1531,8 @@ def main() -> None:
             if previous_answers and f'q{i}' in previous_answers and not st.session_state.get(val_key):
                 st.session_state[val_key] = previous_answers[f'q{i}']
                 print(f"[DEBUG] Q{i} populated from previous session: {previous_answers[f'q{i}'][:50]}...")
+            elif st.session_state.get(val_key):
+                print(f"[DEBUG] Q{i} using existing session state value: {st.session_state.get(val_key)[:50]}...")
             
             # Use session state value (which now contains previous answer if available, or retry answer if updated)
             current_value = st.session_state.get(val_key, '')
@@ -1781,6 +1783,7 @@ def main() -> None:
                             # FIX 1: Replace text in answer boxes at the top with new answers
                             for i in range(1, 4):
                                 st.session_state[f'q{i}_val'] = retry_answers[f'q{i}']
+                                print(f"[RETRY] Updated session state q{i}_val with: {retry_answers[f'q{i}'][:50]}...")
                             
                             # FIX 2: Erase any conversation text and reset conversation state
                             st.session_state['conversation_text'] = ''
