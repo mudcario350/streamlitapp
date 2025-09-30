@@ -3,7 +3,7 @@
 import time
 import datetime
 import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import uuid
 import threading
 from queue import Queue, Empty
@@ -13,6 +13,7 @@ import logging
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import Tool
@@ -29,17 +30,229 @@ except ImportError:
     SCROLL_AVAILABLE = False
     st.warning("streamlit-scroll-to-top not installed. Run: pip install streamlit-scroll-to-top")
 
-# Import our custom modules
-from config import (
-    SPREADSHEET_NAME, THRESHOLD_SCORE, 
-    PROMPT_DOC_IDS, PROMPT_NAMES,
-    get_openai_api_key, get_gcp_credentials, get_gemini_api_key,
-    LLM_PROVIDER, DEFAULT_MODEL
-)
-from prompt_manager import PromptManager, get_default_prompts
+# ===========================
+# Configuration (from config.py)
+# ===========================
 
-# Page config must be first
-st.set_page_config(page_title='Dynamic AI Assignment', layout='centered')
+# App Configuration
+SPREADSHEET_NAME = "n8nTest"
+THRESHOLD_SCORE = 8.0  # completion threshold (1-10 scale)
+
+# Google Doc IDs for prompts
+# Replace these with your actual Google Doc IDs
+PROMPT_DOC_IDS = {
+    "grading": "YOUR_GRADING_PROMPT_DOC_ID",
+    "evaluation": "YOUR_EVALUATION_PROMPT_DOC_ID",
+    "conversation": "YOUR_CONVERSATION_PROMPT_DOC_ID"
+}
+
+# Prompt names within each document
+PROMPT_NAMES = {
+    "grading": "grading_prompt",
+    "evaluation": "evaluation_prompt", 
+    "conversation": "conversation_prompt"
+}
+
+def get_openai_api_key():
+    """Get OpenAI API key from Streamlit secrets."""
+    if "openai" not in st.secrets or "api_key" not in st.secrets["openai"]:
+        st.error("OpenAI API key missing. Add under [openai] in secrets.")
+        st.stop()
+    return st.secrets["openai"]["api_key"]
+
+def get_gcp_credentials():
+    """Get GCP credentials from Streamlit secrets."""
+    if "gcp" not in st.secrets:
+        st.error("GCP credentials missing. Add under [gcp] in secrets.")
+        st.stop()
+    return st.secrets["gcp"]
+
+def get_gemini_api_key():
+    """Get Gemini API key from Streamlit secrets."""
+    if "gemini" not in st.secrets or "api_key" not in st.secrets["gemini"]:
+        st.error("Gemini API key missing. Add under [gemini] in secrets.")
+        st.stop()
+    return st.secrets["gemini"]["api_key"]
+
+# LLM Configuration
+LLM_PROVIDER = "gemini"  # Options: "openai" or "gemini"
+DEFAULT_MODEL = {
+    "openai": "gpt-4o-mini-2024-07-18",
+    "gemini": "gemini-2.5-flash"
+}
+
+
+# ===========================
+# Prompt Manager (from prompt_manager.py)
+# ===========================
+
+class PromptManager:
+    def __init__(self, credentials_dict: dict):
+        """Initialize the prompt manager with Google credentials."""
+        self.credentials = Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=['https://www.googleapis.com/auth/documents.readonly']
+        )
+        self.service = build('docs', 'v1', credentials=self.credentials)
+        self._prompts_cache = {}
+    
+    def get_prompt_from_doc(self, doc_id: str, prompt_name: str) -> Optional[str]:
+        """
+        Extract a specific prompt from a Google Doc.
+        
+        Args:
+            doc_id: Google Doc ID (from URL)
+            prompt_name: Name of the prompt to extract (e.g., 'grading_prompt')
+        
+        Returns:
+            The prompt text or None if not found
+        """
+        try:
+            # Get the document content
+            document = self.service.documents().get(documentId=doc_id).execute()
+            
+            # Extract text content
+            content = document.get('body', {}).get('content', [])
+            full_text = self._extract_text_from_content(content)
+            
+            # Parse prompts (assuming format like "GRADING_PROMPT: ...")
+            prompts = self._parse_prompts_from_text(full_text)
+            
+            return prompts.get(prompt_name)
+            
+        except Exception as e:
+            st.error(f"Error loading prompt '{prompt_name}' from Google Doc: {e}")
+            return None
+    
+    def _extract_text_from_content(self, content: list) -> str:
+        """Extract text from Google Doc content structure."""
+        text = ""
+        for element in content:
+            if 'paragraph' in element:
+                for para_element in element['paragraph']['elements']:
+                    if 'textRun' in para_element:
+                        text += para_element['textRun']['content']
+        return text
+    
+    def _parse_prompts_from_text(self, text: str) -> Dict[str, str]:
+        """Parse prompts from text using a simple format."""
+        prompts = {}
+        current_prompt = None
+        current_content = []
+        
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Check if this line starts a new prompt (format: PROMPT_NAME:)
+            if ':' in line and line.split(':')[0].isupper():
+                # Save previous prompt if exists
+                if current_prompt:
+                    prompts[current_prompt] = '\n'.join(current_content).strip()
+                
+                # Start new prompt
+                current_prompt = line.split(':')[0].lower()
+                current_content = []
+                
+                # Add the rest of the line as content if it exists
+                remaining = line.split(':', 1)[1].strip()
+                if remaining:
+                    current_content.append(remaining)
+            else:
+                # Add line to current prompt content
+                if current_prompt:
+                    current_content.append(line)
+        
+        # Save the last prompt
+        if current_prompt:
+            prompts[current_prompt] = '\n'.join(current_content).strip()
+        
+        return prompts
+    
+    def get_cached_prompt(self, doc_id: str, prompt_name: str) -> Optional[str]:
+        """Get a prompt with caching to avoid repeated API calls."""
+        cache_key = f"{doc_id}_{prompt_name}"
+        
+        if cache_key not in self._prompts_cache:
+            self._prompts_cache[cache_key] = self.get_prompt_from_doc(doc_id, prompt_name)
+        
+        return self._prompts_cache[cache_key]
+
+# Example usage and prompt templates
+def get_default_prompts() -> Dict[str, str]:
+    """Fallback prompts if Google Docs are unavailable."""
+    return {
+        "grading_prompt": """You are an AI teaching assistant grading student answers. Please evaluate the following answers and provide feedback and scores.
+
+Student ID: {student_id}
+Execution ID: {execution_id}
+
+Current Student Answers:
+Q1: {q1}
+Q2: {q2}
+Q3: {q3}
+
+Question 1 Context History:
+{q1_context}
+
+Question 2 Context History:
+{q2_context}
+
+Question 3 Context History:
+{q3_context}
+
+Previous Conversations:
+{conversation_context}
+
+Please provide your evaluation in the following JSON format:
+{{
+    "execution_id": "{execution_id}",
+    "student_id": "{student_id}",
+    "score1": <score from 1-10>,
+    "score2": <score from 1-10>,
+    "score3": <score from 1-10>,
+    "feedback1": "<detailed feedback for Q1>",
+    "feedback2": "<detailed feedback for Q2>",
+    "feedback3": "<detailed feedback for Q3>"
+}}
+
+Be thoughtful in your evaluation. Consider clarity, depth of understanding, and relevance to the questions. Use the context history to provide more personalized and relevant feedback.""",
+        
+        "evaluation_prompt": """You are an AI teaching assistant providing improved feedback. Review the previous grading and provide enhanced feedback.
+
+Previous Grading Results:
+{previous_grading}
+
+Please provide improved feedback in the following JSON format:
+{{
+    "execution_id": "{execution_id}",
+    "student_id": "{student_id}",
+    "new_score1": <improved score from 1-10>,
+    "new_score2": <improved score from 1-10>,
+    "new_score3": <improved score from 1-10>,
+    "new_feedback1": "<enhanced feedback for Q1>",
+    "new_feedback2": "<enhanced feedback for Q2>",
+    "new_feedback3": "<enhanced feedback for Q3>"
+}}
+
+Provide more detailed, constructive feedback that will help the student improve.""",
+        
+        "conversation_prompt": """You are an AI teaching assistant helping a student with their assignment feedback.
+
+Here is the full context for this assignment session:
+{context}
+
+Student's new question: {user_question}
+
+Please provide a helpful, encouraging response that addresses their question and provides guidance for improvement. Be supportive and constructive.
+Respond in a conversational tone, as if you're having a one-on-one tutoring session."""
+    } 
+# ===========================
+# Main Application (from source_app.py)
+# ===========================
+
 
 # --- Custom CSS for Modern Look ---
 st.markdown('''
@@ -128,14 +341,11 @@ st.markdown('''
 ''', unsafe_allow_html=True)
 
 # --- Header/Banner ---
-provider_emoji = "🤖" if LLM_PROVIDER == "gemini" else "🧠"
-provider_name = "Gemini" if LLM_PROVIDER == "gemini" else "OpenAI"
-st.markdown(f"""
+st.markdown("""
 <div style='display: flex; align-items: center; justify-content: center; margin-bottom: 1.2rem;'>
     <img src='https://img.icons8.com/color/96/000000/artificial-intelligence.png' style='height: 48px; margin-right: 14px;'>
     <div>
         <h1 style='margin-bottom: 0.1rem; font-size:1.6rem;'>Dynamic AI Assignment</h1>
-        <p style='margin: 0; font-size:0.9rem; color:#666;'>Powered by {provider_emoji} {provider_name}</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -575,7 +785,7 @@ def get_agent():
         )
     else:
         llm = ChatOpenAI(
-            model_name=DEFAULT_MODEL["openai"], 
+                model_name=DEFAULT_MODEL["openai"], 
             temperature=0,
             openai_api_key=OPENAI_API_KEY,
             streaming=True,  # Enable streaming
@@ -1012,7 +1222,19 @@ def main() -> None:
             st.session_state['exec_id'] = str(uuid.uuid4())
         exec_id = st.session_state['exec_id']
         
-        # Initialize question caches with question text
+        # Initialize assignment session with new memory system
+        if not assignment_memory.current_state:
+            questions = {
+                'q1': qrec.get('Question1', ''),
+                'q2': qrec.get('Question2', ''),
+                'q3': qrec.get('Question3', '')
+            }
+            assignment_memory.initialize_assignment_session(exec_id, sid, aid, questions)
+            print(f"[MEMORY] Initialized new assignment session for student {sid}")
+        else:
+            print(f"[MEMORY] Using existing assignment session for student {sid}")
+        
+        # Initialize question caches with question text (backward compatibility)
         context_cache.initialize_question_cache('1', qrec.get('Question1', ''))
         context_cache.initialize_question_cache('2', qrec.get('Question2', ''))
         context_cache.initialize_question_cache('3', qrec.get('Question3', ''))
@@ -1025,6 +1247,16 @@ def main() -> None:
         reset_counter = st.session_state.get('reset_counter', 0)
         
         print(f"[DEBUG] Main function - fb exists: {bool(fb)}, submitted: {submitted}")
+        
+        # Debug: Show memory system status
+        if assignment_memory.current_state:
+            memory_state = assignment_memory.current_state
+            print(f"[MEMORY DEBUG] Session active for student {memory_state['student_id']}")
+            print(f"[MEMORY DEBUG] Messages count: {len(memory_state.get('messages', []))}")
+            print(f"[MEMORY DEBUG] Scores: {memory_state.get('scores', {})}")
+            print(f"[MEMORY DEBUG] Answers: {len([k for k, v in memory_state.get('answers', {}).items() if v])}/3")
+        else:
+            print("[MEMORY DEBUG] No active assignment session")
 
         # --- Questions and Answers (single column) ---
         for i in range(1, 4):
@@ -1092,6 +1324,12 @@ def main() -> None:
                             response = answers.get(f'q{i}', '')
                             feedback = grade_res.get(f'feedback{i}', '')
                             score = grade_res.get(f'score{i}', '')
+                            
+                            # Add to new memory system
+                            assignment_memory.add_student_answer(str(i), response)
+                            assignment_memory.add_grading_result(str(i), int(score) if score else 0, feedback)
+                            
+                            # Also add to backward compatibility cache
                             context_cache.add_response_and_feedback(str(i), response, feedback, score)
                         
                         # Store in session state for the rest of the app
@@ -1166,7 +1404,8 @@ def main() -> None:
                             background_writer.write_async('conversations', conv_res)
                             agent_msg = conv_res.get('agent_msg', conv_res.get('content', 'No response available'))
                             
-                            # Add to conversation cache
+                            # Add to conversation cache (both new and old systems)
+                            assignment_memory.add_conversation(user_q, agent_msg)
                             context_cache.add_conversation(user_q, agent_msg)
                             
                             # Store the response in session state to persist it
@@ -1250,6 +1489,12 @@ def main() -> None:
                                 response = retry_answers.get(f'q{i}', '')
                                 feedback = grade_res.get(f'feedback{i}', '')
                                 score = grade_res.get(f'score{i}', '')
+                                
+                                # Add to new memory system
+                                assignment_memory.add_student_answer(str(i), response)
+                                assignment_memory.add_grading_result(str(i), int(score) if score else 0, feedback)
+                                
+                                # Also add to backward compatibility cache
                                 context_cache.add_response_and_feedback(str(i), response, feedback, score)
                             
                             # FIX 1: Replace text in answer boxes at the top with new answers
