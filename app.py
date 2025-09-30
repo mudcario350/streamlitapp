@@ -796,13 +796,59 @@ def get_assignment_memory_manager():
 
 assignment_memory = get_assignment_memory_manager()
 
-def load_previous_session_data(student_id: str, assignment_id: str, questions: Dict[str, str]) -> tuple[Dict[str, str], Dict[str, Any], str]:
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def load_previous_session_data(student_id: str, assignment_id: str) -> tuple[Dict[str, str], Dict[str, Any], str]:
     """
     Load previous session data for a student and assignment.
     Returns: (previous_answers, previous_feedback, latest_conversation_response)
     """
     try:
-        # Get all previous data for memory loading
+        print(f"[SESSION RESTORE] Loading data for student {student_id}, assignment {assignment_id}")
+        
+        # Get all data in one go to minimize API calls
+        all_answers = sheets.get_all_answers_for_memory(student_id, assignment_id)
+        all_grading = sheets.get_all_grading_for_memory(student_id, assignment_id)
+        all_conversations = sheets.get_all_conversations_for_memory(student_id, assignment_id)
+        
+        # Find the most recent records for UI display
+        latest_answers = {}
+        latest_grading = {}
+        latest_conversation = {}
+        
+        if all_answers:
+            latest_answers = max(all_answers, key=lambda x: x.get("timestamp", ""))
+        if all_grading:
+            latest_grading = max(all_grading, key=lambda x: x.get("timestamp", ""))
+        if all_conversations:
+            latest_conversation = max(all_conversations, key=lambda x: x.get("timestamp", ""))
+        
+        # Prepare previous answers for UI
+        previous_answers = {}
+        for i in range(1, 4):
+            answer_key = f"q{i}"
+            if answer_key in latest_answers:
+                previous_answers[answer_key] = latest_answers[answer_key]
+        
+        # Get latest conversation response for UI
+        latest_conversation_response = latest_conversation.get("agent_msg", "") if latest_conversation else ""
+        
+        print(f"[SESSION RESTORE] Found {len(all_answers)} answer records, {len(all_grading)} grading records, {len(all_conversations)} conversation records")
+        
+        return previous_answers, latest_grading, latest_conversation_response
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to load previous session data: {e}")
+        return {}, {}, ""
+
+def load_session_data_into_memory(student_id: str, assignment_id: str):
+    """
+    Load all session data into memory system (separate from UI data loading).
+    This is called only once per session.
+    """
+    try:
+        print(f"[MEMORY LOAD] Loading data into memory for student {student_id}, assignment {assignment_id}")
+        
+        # Get all data for memory loading
         all_answers = sheets.get_all_answers_for_memory(student_id, assignment_id)
         all_grading = sheets.get_all_grading_for_memory(student_id, assignment_id)
         all_conversations = sheets.get_all_conversations_for_memory(student_id, assignment_id)
@@ -831,28 +877,10 @@ def load_previous_session_data(student_id: str, assignment_id: str, questions: D
             if user_msg and agent_msg:
                 assignment_memory.add_conversation(user_msg, agent_msg)
         
-        # Get the most recent data for UI display
-        latest_answers = sheets.get_latest_answers(student_id, assignment_id)
-        latest_grading = sheets.get_latest_grading(student_id, assignment_id)
-        latest_conversation = sheets.get_latest_conversation(student_id, assignment_id)
-        
-        # Prepare previous answers for UI
-        previous_answers = {}
-        for i in range(1, 4):
-            answer_key = f"q{i}"
-            if answer_key in latest_answers:
-                previous_answers[answer_key] = latest_answers[answer_key]
-        
-        # Get latest conversation response for UI
-        latest_conversation_response = latest_conversation.get("agent_msg", "") if latest_conversation else ""
-        
-        print(f"[SESSION RESTORE] Loaded {len(all_answers)} answer records, {len(all_grading)} grading records, {len(all_conversations)} conversation records")
-        
-        return previous_answers, latest_grading, latest_conversation_response
+        print(f"[MEMORY LOAD] Loaded {len(all_answers)} answer records, {len(all_grading)} grading records, {len(all_conversations)} conversation records into memory")
         
     except Exception as e:
-        print(f"[ERROR] Failed to load previous session data: {e}")
-        return {}, {}, ""
+        print(f"[ERROR] Failed to load session data into memory: {e}")
 
 # Backward compatibility wrapper for existing code
 class ContextCache:
@@ -1405,21 +1433,17 @@ def main() -> None:
         previous_feedback = {}
         latest_conversation_response = ""
         
-        # Check if there's previous data (answers or conversations)
-        latest_answers = sheets.get_latest_answers(sid, aid)
-        latest_conversation = sheets.get_latest_conversation(sid, aid)
+        # Check if there's previous data (answers or conversations) - use cached function
+        previous_answers, previous_feedback, latest_conversation_response = load_previous_session_data(sid, aid)
         
-        if latest_answers or latest_conversation:
+        if previous_answers or previous_feedback or latest_conversation_response:
             has_previous_data = True
             print(f"[SESSION RESTORE] Found previous data for student {sid}, assignment {aid}")
             
-            # Load all previous session data into memory
-            questions = {
-                'q1': qrec.get('Question1', ''),
-                'q2': qrec.get('Question2', ''),
-                'q3': qrec.get('Question3', '')
-            }
-            previous_answers, previous_feedback, latest_conversation_response = load_previous_session_data(sid, aid, questions)
+            # Load all previous session data into memory (only once per session)
+            if not st.session_state.get('memory_loaded', False):
+                load_session_data_into_memory(sid, aid)
+                st.session_state['memory_loaded'] = True
         
         # Initialize assignment session with new memory system
         if not assignment_memory.current_state:
