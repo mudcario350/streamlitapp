@@ -1452,17 +1452,21 @@ def main() -> None:
         previous_feedback = {}
         latest_conversation_response = ""
         
-        # Check if there's previous data (answers or conversations) - use cached function
-        previous_answers, previous_feedback, latest_conversation_response = load_previous_session_data(sid, aid)
-        
-        if previous_answers or previous_feedback or latest_conversation_response:
-            has_previous_data = True
-            print(f"[SESSION RESTORE] Found previous data for student {sid}, assignment {aid}")
+        # Only load previous data if the assignment has been started (started == 'TRUE')
+        if started_status == 'TRUE':
+            # Check if there's previous data (answers or conversations) - use cached function
+            previous_answers, previous_feedback, latest_conversation_response = load_previous_session_data(sid, aid)
             
-            # Load all previous session data into memory (only once per session)
-            if not st.session_state.get('memory_loaded', False):
-                load_session_data_into_memory(sid, aid)
-                st.session_state['memory_loaded'] = True
+            if previous_answers or previous_feedback or latest_conversation_response:
+                has_previous_data = True
+                print(f"[SESSION RESTORE] Found previous data for student {sid}, assignment {aid}")
+                
+                # Load all previous session data into memory (only once per session)
+                if not st.session_state.get('memory_loaded', False):
+                    load_session_data_into_memory(sid, aid)
+                    st.session_state['memory_loaded'] = True
+        else:
+            print(f"[SESSION] Assignment not started yet (started={started_status}) - loading fresh form")
         
         # Initialize assignment session with new memory system
         if not assignment_memory.current_state:
