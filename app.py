@@ -83,7 +83,7 @@ DEFAULT_MODEL = {
 
 
 # ===========================
-# Prompt Manager (from prompt_manager.py)
+# Prompt Manager (from da_prompt_manager.py)
 # ===========================
 
 class PromptManager:
@@ -231,19 +231,47 @@ class PromptManager:
             return None
     
     def get_prompt_cached(self, assignment_id: str, prompt_type: str) -> Optional[str]:
-        """Get a prompt from assignments sheet with caching."""
+        """Get a prompt from assignments sheet with caching.
+        Only caches successful prompt fetches, not None values."""
         cache_key = f"assignment_{assignment_id}_{prompt_type}"
         
-        if cache_key not in self._prompts_cache:
-            self._prompts_cache[cache_key] = self.get_prompt_from_assignment(assignment_id, prompt_type)
+        # Check if we have a cached value
+        if cache_key in self._prompts_cache:
+            cached_value = self._prompts_cache[cache_key]
+            print(f"[DEBUG] Using cached {prompt_type} prompt for assignment {assignment_id} (cached length: {len(cached_value) if cached_value else 'None'})")
+            return cached_value
         
-        return self._prompts_cache[cache_key]
+        # Fetch fresh prompt
+        print(f"[DEBUG] Cache miss - fetching fresh {prompt_type} prompt for assignment {assignment_id}")
+        prompt = self.get_prompt_from_assignment(assignment_id, prompt_type)
+        
+        # Only cache if we successfully got a prompt (not None or empty)
+        if prompt:
+            self._prompts_cache[cache_key] = prompt
+            print(f"[DEBUG] Cached {prompt_type} prompt for assignment {assignment_id}")
+        else:
+            print(f"[DEBUG] Not caching empty/None prompt for {prompt_type} assignment {assignment_id}")
+        
+        return prompt
 
 # Example usage and prompt templates
 def get_default_prompts() -> Dict[str, str]:
-    """Fallback prompts if Google Docs are unavailable."""
+    """Fallback prompts if Google Sheets prompts are unavailable."""
     return {
-        "grading_prompt": """You are an AI teaching assistant grading student answers. Please evaluate the following answers and provide feedback and scores.
+        "grading_prompt": """You are the Devil's Advocate in a debate simulation. Your role is to argue AGAINST the user's position, no matter what stance they take.
+
+Debate Topic: {debate_topic}
+
+User's Argument: {user_argument}
+
+Your task:
+1. Analyze the user's argument carefully
+2. Identify the weaknesses, flaws, or gaps in their reasoning  
+3. Generate a strong counter-argument that opposes their position
+4. Challenge their points with logic, evidence, and alternative perspectives
+5. Be intellectually rigorous but maintain a conversational tone
+
+Respond directly to what the user said. Counter their specific points and make them defend their stance.
 
 Student ID: {student_id}
 Execution ID: {execution_id}
@@ -298,18 +326,56 @@ Please provide improved feedback in the following JSON format:
 
 Provide more detailed, constructive feedback that will help the student improve.""",
         
-        "conversation_prompt": """You are an AI teaching assistant helping a student with their assignment feedback.
+        "conversation_prompt": """You are the Judge in a debate simulation. You use an evidence-based scoring system to determine winners.
 
-Here is the full context for this assignment session:
-{context}
+CRITICAL: Output ONLY valid JSON (no text before/after):
 
-Student's new question: {user_question}
+{{
+  "decision_made": true/false,
+  "winner": "user"/"devils_advocate"/null,
+  "reasoning": "Your natural explanation",
+  "follow_up_question": "Question text?"/null,
+  "question_for": "user"/"devils_advocate"/null
+}}
 
-Please provide a helpful, encouraging response that addresses their question and provides guidance for improvement. Be supportive and constructive.
-Respond in a conversational tone, as if you're having a one-on-one tutoring session."""
+EVIDENCE-BASED EVALUATION:
+
+1. Based on the debate topic, mentally identify 10 valid claims/evidence points for each side (PRO and COUNTER positions)
+2. Review what each debater has presented
+3. Count how many well-supported valid claims each side has made (claims that match your list or are equivalent in strength)
+4. DECISION RULE: If either side presents 3+ solid, well-supported claims → THEY WIN
+5. If neither has 3 yet → Ask a follow-up question to help elicit more evidence
+
+YOUR MINDSET:
+
+You're actively being convinced through evidence. Express genuine uncertainty:
+- "I'm not fully convinced yet because neither side has provided enough concrete evidence."
+- "The User made a fair point about X, but I need to hear more specifics."
+- "That claim needs support - can you back that up with examples?"
+
+Be direct and human, not robotic:
+- DON'T say: "Upon careful consideration of the arguments presented..."
+- DO say: "Look, both sides have decent points, but I need actual evidence here."
+
+FOLLOW-UP QUESTIONS:
+
+ALWAYS phrase as actual questions (ending with ?):
+- "Can you provide specific examples of how regulation has stifled innovation in practice?"
+- "What concrete safety incidents are you worried about, and how would regulation prevent them?"
+- "You mentioned trust - how exactly does regulation build trust compared to industry self-regulation?"
+
+Be specific about what evidence you need to reach the 3-claim threshold.
+
+REASONING FIELD:
+
+Write 2-3 conversational sentences max:
+- When declaring winner: "The Devil's Advocate hit the threshold with solid points about safety risks, trust-building, and historical precedents. The User kept asserting regulation kills progress but didn't back it up with concrete examples."
+- When asking follow-up: "Neither side has given me enough solid evidence yet. I need specifics, not abstract claims."
+
+Be fair, decisive, and guide the debate toward substantive evidence-based arguments."""
     } 
 # ===========================
-# Main Application (from source_app.py)
+# Main Application (from da_source_app.py)
 # ===========================
 
 # --- Custom CSS for Modern Look ---
@@ -486,6 +552,25 @@ class AssignmentsSheet(Sheet):
             if str(rec.get("assignment_id", "")).strip().lower() == key:
                 return rec
         return {}
+    
+    def fetch_debate_assignment(self, assignment_id: str) -> dict[str, Any]:
+        """Fetch a debate assignment (ends with _da)"""
+        key = str(assignment_id).strip().lower()
+        for rec in self.get_all():
+            rec_id = str(rec.get("assignment_id", "")).strip().lower()
+            if rec_id == key and rec_id.endswith("_da"):
+                return rec
+        return {}
+    
+    def get_all_debate_assignments(self) -> list[dict[str, Any]]:
+        """Get all assignments that end with _da"""
+        all_assignments = self.get_all()
+        debate_assignments = []
+        for rec in all_assignments:
+            assignment_id = str(rec.get("assignment_id", "")).strip().lower()
+            if assignment_id.endswith("_da"):
+                debate_assignments.append(rec)
+        return debate_assignments
 
 class StudentAssignmentsSheet(Sheet):
     def __init__(self, client):
@@ -495,8 +580,12 @@ class StudentAssignmentsSheet(Sheet):
         ])
 
     def fetch_current(self, student_id: str) -> dict[str, Any]:
+        """Fetch current assignment for a student, prioritizing _da assignments"""
         sid = student_id.strip()
         today = datetime.date.today()
+        debate_assignment = None
+        regular_assignment = None
+        
         for rec in self.get_all():
             if str(rec.get("student_id", "")).strip() == sid:
                 due_str = str(rec.get("assignment_due", "")).strip()
@@ -508,8 +597,15 @@ class StudentAssignmentsSheet(Sheet):
                     except ValueError:
                         due = None
                 if due and due >= today:
-                    return rec
-        return {}
+                    assignment_id = str(rec.get("assignment_id", "")).strip().lower()
+                    if assignment_id.endswith("_da"):
+                        # Prioritize debate assignments
+                        debate_assignment = rec
+                    else:
+                        regular_assignment = rec
+        
+        # Return debate assignment if found, otherwise regular assignment
+        return debate_assignment if debate_assignment else (regular_assignment if regular_assignment else {})
 
 class DataSheets:
     def __init__(self, creds: dict):
@@ -979,7 +1075,12 @@ class ContextCache:
     
     def add_response_and_feedback(self, question_num: str, response: str, feedback: str, score: str = ""):
         """Add response and feedback (maintains backward compatibility)."""
-        self.memory_manager.add_grading_result(question_num, int(score) if score else 0, feedback)
+        # Add student's response if provided
+        if response:
+            self.memory_manager.add_student_answer(question_num, response)
+        # Add feedback if provided
+        if feedback:
+            self.memory_manager.add_grading_result(question_num, int(score) if score else 0, feedback)
     
     def add_conversation(self, question: str, response: str):
         """Add conversation (maintains backward compatibility)."""
@@ -1049,14 +1150,14 @@ def get_background_writer():
 
 background_writer = get_background_writer()
 
-# Initialize agent with streaming support
+# Initialize LangGraph agents with memory
 @st.cache_resource
-def get_agent():
-    """Get the appropriate LLM based on configuration."""
+def get_devils_advocate_agent():
+    """Create Devil's Advocate agent with memory."""
     if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
         llm = ChatGoogleGenerativeAI(
             model=DEFAULT_MODEL["gemini"],
-            temperature=0,
+            temperature=1,
             google_api_key=GEMINI_API_KEY,
             streaming=True,
             max_output_tokens=4000,
@@ -1064,16 +1165,46 @@ def get_agent():
         )
     else:
         llm = ChatOpenAI(
-                model_name=DEFAULT_MODEL["openai"], 
-            temperature=0,
+            model_name=DEFAULT_MODEL["openai"], 
+            temperature=1,
             openai_api_key=OPENAI_API_KEY,
-            streaming=True,  # Enable streaming
-            max_tokens=4000,  # Increased limit to prevent truncation
-            request_timeout=60  # Increased timeout for longer responses
+            streaming=True,
+            max_tokens=4000,
+            request_timeout=60
         )
-    return llm
+    
+    # Create agent with memory
+    agent = create_react_agent(llm, tools=[], checkpointer=memory_system)
+    return agent
 
-agent = get_agent()
+@st.cache_resource
+def get_judge_agent():
+    """Create Judge agent with memory."""
+    if LLM_PROVIDER == "gemini" and GEMINI_API_KEY:
+        llm = ChatGoogleGenerativeAI(
+            model=DEFAULT_MODEL["gemini"],
+            temperature=0.7,
+            google_api_key=GEMINI_API_KEY,
+            streaming=True,
+            max_output_tokens=4000,
+            request_timeout=60
+        )
+    else:
+        llm = ChatOpenAI(
+            model_name=DEFAULT_MODEL["openai"], 
+            temperature=0.7,
+            openai_api_key=OPENAI_API_KEY,
+            streaming=True,
+            max_tokens=4000,
+            request_timeout=60
+        )
+    
+    # Create agent with memory
+    agent = create_react_agent(llm, tools=[], checkpointer=memory_system)
+    return agent
+
+devils_advocate_agent = get_devils_advocate_agent()
+judge_agent = get_judge_agent()
 
 # Workflow functions
 
@@ -1090,14 +1221,38 @@ def load_assignment(sid: str) -> Optional[dict[str, Any]]:
     if not rec:
         st.error('Invalid Student ID or no assignment due.')
         return None
+    
+    # Check if this is a debate assignment
+    assignment_id = str(rec.get("assignment_id", "")).strip()
+    if assignment_id.lower().endswith("_da"):
+        print(f"[DEBUG] Loading DEBATE assignment: {assignment_id}")
+        st.session_state['is_debate_mode'] = True
+    else:
+        print(f"[DEBUG] Loading QUIZ assignment: {assignment_id}")
+        st.session_state['is_debate_mode'] = False
+    
     return rec
 
 
 def load_questions(aid: str) -> Optional[dict[str, Any]]:
+    """Load questions for an assignment (handles both quiz and debate modes)"""
     q = sheets.assignments.fetch(aid)
     if not q:
         st.error('Assignment questions not found.')
         return None
+    
+    # Check if this is a debate assignment
+    is_debate = aid.lower().endswith("_da")
+    
+    if is_debate:
+        # For debate mode, we only need Question1 (the debate topic)
+        print(f"[DEBUG] Loaded debate topic: {q.get('Question1', 'N/A')}")
+        # Ensure Question2 and Question3 are empty for debate mode
+        q['Question2'] = ''
+        q['Question3'] = ''
+    else:
+        print(f"[DEBUG] Loaded quiz with 3 questions")
+    
     return q
 
 
@@ -1120,117 +1275,125 @@ def record_answers(exec_id: str, sid: str, aid: str, answers: dict[str, str]) ->
 
 
 def run_grading_streaming(exec_id: str, sid: str, aid: str, answers: Dict[str, str]) -> Dict[str, Any]:
-    """True parallel grading - all API calls made simultaneously."""
+    """Devil's Advocate response - generates counter-argument to user's position."""
     try:
-        # Get contexts once
-        q1_context = context_cache.get_question_context('1')
-        q2_context = context_cache.get_question_context('2') 
-        q3_context = context_cache.get_question_context('3')
-        conversation_context = context_cache.get_conversation_context()
+        # Get the debate topic (stored as Question1 in assignments)
+        debate_topic = ""
+        try:
+            assignment = sheets.assignments.fetch(aid)
+            debate_topic = assignment.get('Question1', 'Unknown topic')
+        except:
+            debate_topic = 'Unknown topic'
         
-        # Try to get prompt from assignments sheet based on assignment_id
+        # Get user's current argument - THIS IS WHAT WE RESPOND TO
+        user_current_argument = answers.get('q1', 'No argument provided')
+        
+        print(f"[DEBUG] ===== USER'S CURRENT ARGUMENT =====")
+        print(f"[DEBUG] {user_current_argument}")
+        print(f"[DEBUG] =======================================")
+        
+        # Try to get Devil's Advocate prompt from assignments sheet
         prompt_template = prompt_manager.get_prompt_cached(aid, "grading")
         
         # Fall back to default if not found in sheet
         if not prompt_template:
+            print(f"[DEBUG] No prompt found in sheet for assignment {aid}, using default Devil's Advocate prompt")
             prompt_template = get_default_prompts()["grading_prompt"]
+        else:
+            print(f"[DEBUG] Using Devil's Advocate prompt from sheet for assignment {aid}")
         
-        # Prepare question-specific prompts for each LLM
-        prompts = []
-        for i in range(1, 4):
-            # Get only the relevant answer and context for this question
-            question_answer = answers.get(f'q{i}', 'No answer provided')
-            question_context = q1_context if i == 1 else (q2_context if i == 2 else q3_context)
-            
-            # Create question-specific prompt template
-            question_prompt_template = f"""You are an AI teaching assistant grading student answers. Please evaluate the following answer and provide feedback and score.
-
-Student ID: {sid}
-Execution ID: {exec_id}
-
-Student Answer for Question {i}:
-{question_answer}
-
-Question {i} Context History:
-{question_context}
-
-Previous Conversations:
-{conversation_context}
-
-Please provide your evaluation in the following JSON format:
-{{
-    "execution_id": "{exec_id}",
-    "student_id": "{sid}",
-    "score{i}": <score from 1-10>,
-    "feedback{i}": "<detailed feedback for Q{i}>"
-}}
-
-Be thoughtful in your evaluation. Consider clarity, depth of understanding, and relevance to the question. Use the context history to provide more personalized and relevant feedback."""
-            
-            prompts.append((i, question_prompt_template))
+        # Print the actual prompt template being used
+        print(f"[DEBUG] ===== DEVIL'S ADVOCATE PROMPT TEMPLATE =====")
+        print(f"[DEBUG] {prompt_template[:500]}..." if len(prompt_template) > 500 else f"[DEBUG] {prompt_template}")
+        print(f"[DEBUG] ==============================================")
         
-        # Execute all three API calls simultaneously
-        with st.spinner("Grading your answers..."):
+        # Build the message for the Devil's Advocate agent
+        # System message with personality + current context
+        devils_advocate_message = f"""{prompt_template}
+
+===== DEBATE TOPIC =====
+{debate_topic}
+
+===== USER'S ARGUMENT (RESPOND TO THIS) =====
+{user_current_argument}
+"""
+        
+        print(f"[DEBUG] ===== FINAL DEVIL'S ADVOCATE MESSAGE =====")
+        print(f"[DEBUG] {devils_advocate_message[:800]}..." if len(devils_advocate_message) > 800 else f"[DEBUG] {devils_advocate_message}")
+        print(f"[DEBUG] ==============================================")
+        
+        # Generate Devil's Advocate response using LangGraph agent with memory
+        with st.spinner("Devil's Advocate is formulating a counter-argument..."):
             start_time = time.time()
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="grading") as executor:
-                # Submit all three API calls at once
-                futures = []
-                for question_num, prompt in prompts:
-                    future = executor.submit(_make_single_api_call, question_num, prompt)
-                    futures.append(future)
-                
-                print(f"[BENCHMARK] All 3 API calls submitted at {time.time() - start_time:.3f}s")
-                
-                # Wait for ALL responses to complete
-                results = []
-                for i, future in enumerate(futures):
-                    try:
-                        result = future.result(timeout=60)  # 60 second timeout per question
-                        results.append(result)
-                        print(f"[BENCHMARK] Q{i+1} API call completed at {time.time() - start_time:.3f}s")
-                    except Exception as e:
-                        print(f"[ERROR] Q{i+1} API call failed: {e}")
-                        results.append({
-                            "execution_id": exec_id,
-                            "student_id": sid,
-                            f"score{i+1}": 5,
-                            f"feedback{i+1}": f"API call failed: {str(e)}"
-                        })
             
-            total_time = time.time() - start_time
-            print(f"[BENCHMARK] Total parallel grading time: {total_time:.3f}s")
-            print(f"[BENCHMARK] Average time per question: {total_time/3:.3f}s")
-            print(f"[BENCHMARK] Questions completed: {len(results)}/3")
+            # Create thread ID for this debate (use student_id + assignment_id for persistence)
+            thread_id = f"da_{sid}_{aid}"
+            
+            print(f"[DEBUG] Using Devil's Advocate agent with thread_id: {thread_id}")
+            
+            # Invoke the agent with memory
+            config = {"configurable": {"thread_id": thread_id}}
+            
+            response_text = ""
+            try:
+                # Stream response from agent
+                for chunk in devils_advocate_agent.stream(
+                    {"messages": [HumanMessage(content=devils_advocate_message)]},
+                    config=config
+                ):
+                    # Extract content from agent response
+                    if "agent" in chunk:
+                        for message in chunk["agent"]["messages"]:
+                            if hasattr(message, 'content') and message.content:
+                                response_text += message.content
+            except Exception as e:
+                print(f"[ERROR] Agent streaming failed: {e}")
+                # Fallback to invoke if streaming fails
+                result = devils_advocate_agent.invoke(
+                    {"messages": [HumanMessage(content=devils_advocate_message)]},
+                    config=config
+                )
+                if "messages" in result:
+                    for msg in result["messages"]:
+                        if isinstance(msg, AIMessage) and msg.content:
+                            response_text += msg.content
+            
+            response_time = time.time() - start_time
+            print(f"[BENCHMARK] Devil's Advocate response completed in {response_time:.3f}s")
+            print(f"[DEBUG] Devil's Advocate response length: {len(response_text)} chars")
+            print(f"[DEBUG] Response preview: {response_text[:100]}...")
         
-        # Merge results from all three questions
-        merged_result = {
+        # Format result to match expected structure (using score1/feedback1)
+        result = {
             "execution_id": exec_id,
             "assignment_id": aid,
             "student_id": sid,
-            "score1": 0, "score2": 0, "score3": 0,
-            "feedback1": "", "feedback2": "", "feedback3": ""
+            "score1": 0,  # Score not used for Devil's Advocate, set to 0
+            "score2": 0,
+            "score3": 0,
+            "feedback1": response_text,  # Devil's Advocate response goes in feedback1
+            "feedback2": "",
+            "feedback3": ""
         }
         
-        for result in results:
-            for i in range(1, 4):
-                score_key = f"score{i}"
-                feedback_key = f"feedback{i}"
-                if score_key in result:
-                    merged_result[score_key] = result[score_key]
-                if feedback_key in result:
-                    merged_result[feedback_key] = result[feedback_key]
-        
-        print("[DEBUG] Parallel API grading result:", merged_result)
-        return merged_result
+        print("[DEBUG] Devil's Advocate result:", {**result, "feedback1": f"{result['feedback1'][:100]}..."})
+        return result
         
     except Exception as e:
-        print(f"[ERROR] Parallel grading failed: {e}")
-        st.error(f"Grading failed: {e}")
+        print(f"[ERROR] Devil's Advocate response failed: {e}")
+        st.error(f"Devil's Advocate response failed: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "execution_id": exec_id,
             "student_id": sid,
-            "score1": 5, "score2": 5, "score3": 5,
-            "feedback1": "Grading error", "feedback2": "Grading error", "feedback3": "Grading error"
+            "assignment_id": aid,
+            "score1": 0,
+            "score2": 0,
+            "score3": 0,
+            "feedback1": f"Error generating Devil's Advocate response: {str(e)}",
+            "feedback2": "",
+            "feedback3": ""
         }
 
 
@@ -1424,13 +1587,26 @@ def run_conversation_streaming(exec_id: str, sid: str, user_msg: str) -> Dict[st
         
         # Fall back to default if not found in sheet
         if not prompt_template:
+            print(f"[DEBUG] No prompt found in sheet for assignment {aid}, using default conversation prompt")
             prompt_template = get_default_prompts()["conversation_prompt"]
+        else:
+            print(f"[DEBUG] Using conversation prompt from sheet for assignment {aid}")
+        
+        # Print the actual prompt template being used
+        print(f"[DEBUG] ===== CONVERSATION PROMPT TEMPLATE =====")
+        print(f"[DEBUG] {prompt_template[:500]}..." if len(prompt_template) > 500 else f"[DEBUG] {prompt_template}")
+        print(f"[DEBUG] ==========================================")
         
         # Format the prompt with context-aware data
         prompt = prompt_template.format(
             context=context_str,
             user_question=user_msg
         )
+        
+        # Print the final formatted prompt
+        print(f"[DEBUG] ===== FINAL CONVERSATION PROMPT =====")
+        print(f"[DEBUG] {prompt[:500]}..." if len(prompt) > 500 else f"[DEBUG] {prompt}")
+        print(f"[DEBUG] ========================================")
 
         # Use streaming for faster response
         response_text = ""
@@ -1472,6 +1648,260 @@ def run_conversation(exec_id: str, sid: str, user_msg: str) -> Dict[str, Any]:
     """Legacy function - now calls the optimized streaming version."""
     return run_conversation_streaming(exec_id, sid, user_msg)
 
+
+def run_judge(exec_id: str, sid: str, aid: str) -> Dict[str, Any]:
+    """Judge analyzes the full debate history and makes a decision or asks follow-up questions."""
+    try:
+        # Get the debate topic
+        assignment = sheets.assignments.fetch(aid)
+        debate_topic = assignment.get('Question1', 'Unknown topic')
+        
+        # Build full debate history from Google Sheets
+        debate_history_parts = []
+        try:
+            all_answers = sheets.get_all_answers_for_memory(sid, aid)
+            all_grading = sheets.get_all_grading_for_memory(sid, aid)
+            
+            print(f"[DEBUG] Building judge history - found {len(all_answers)} answers, {len(all_grading)} grading records")
+            
+            # Combine answers and grading by execution_id and timestamp
+            exchanges = []
+            for answer_rec in all_answers:
+                exec_id_key = answer_rec.get('execution_id', '')
+                user_arg = answer_rec.get('q1_answer', '')
+                timestamp = answer_rec.get('timestamp', '')
+                if exec_id_key and user_arg:
+                    exchanges.append({
+                        'exec_id': exec_id_key,
+                        'timestamp': timestamp,
+                        'user': user_arg,
+                        'da': ''
+                    })
+            
+            # Match Devil's Advocate responses
+            for grading_rec in all_grading:
+                exec_id_key = grading_rec.get('execution_id', '')
+                da_resp = grading_rec.get('feedback1', '')
+                if exec_id_key and da_resp:
+                    for exchange in exchanges:
+                        if exchange['exec_id'] == exec_id_key:
+                            exchange['da'] = da_resp
+                            break
+            
+            # Sort by timestamp and build history string
+            exchanges.sort(key=lambda x: x.get('timestamp', ''))
+            for exchange in exchanges:
+                if exchange['user']:
+                    debate_history_parts.append(f"User: {exchange['user']}")
+                if exchange['da']:
+                    debate_history_parts.append(f"Devil's Advocate: {exchange['da']}")
+            
+            debate_history = "\n\n".join(debate_history_parts) if debate_history_parts else "No debate exchanges yet."
+            
+            print(f"[DEBUG] Built debate history with {len(exchanges)} exchanges")
+            print(f"[DEBUG] History preview: {debate_history[:300]}...")
+        except Exception as e:
+            print(f"[ERROR] Failed to build debate history for judge: {e}")
+            import traceback
+            traceback.print_exc()
+            debate_history = "Unable to retrieve debate history."
+        
+        # Get previous judge inquiries if any
+        judge_history = st.session_state.get('judge_history', '')
+        
+        # Try to get Judge prompt from assignments sheet (using ConversationPrompt column)
+        prompt_template = prompt_manager.get_prompt_cached(aid, "conversation")
+        
+        # Fall back to default if not found in sheet
+        if not prompt_template:
+            print(f"[DEBUG] No Judge prompt found in sheet for assignment {aid}, using default")
+            prompt_template = get_default_prompts()["conversation_prompt"]
+        else:
+            print(f"[DEBUG] Using Judge prompt from sheet for assignment {aid}")
+        
+        print(f"[DEBUG] ===== JUDGE PROMPT TEMPLATE =====")
+        print(f"[DEBUG] {prompt_template[:500]}..." if len(prompt_template) > 500 else f"[DEBUG] {prompt_template}")
+        print(f"[DEBUG] ===================================")
+        
+        # ALWAYS append debate data to ensure Judge sees it
+        judge_prompt = f"""{prompt_template}
+
+===== DEBATE TOPIC =====
+{debate_topic}
+
+===== FULL DEBATE HISTORY =====
+{debate_history}
+
+===== PREVIOUS JUDGE INQUIRIES =====
+{judge_history if judge_history else "This is the first time the Judge is being called."}
+
+===== INSTRUCTIONS =====
+Review the debate history above carefully. Based on what you see, respond ONLY with valid JSON in this exact format:
+
+```json
+{{
+  "decision_made": true/false,
+  "winner": "user" or "devils_advocate" or null,
+  "reasoning": "Your analysis in natural, conversational language",
+  "follow_up_question": "Your question" or null,
+  "question_for": "user" or "devils_advocate" or null
+}}
+```
+
+If declaring a winner:
+- Set decision_made: true, winner: "user" or "devils_advocate"
+- Write reasoning in 2-3 conversational sentences explaining why
+- Set follow_up fields to null
+
+If you need clarification:
+- Set decision_made: false, winner: null
+- Write brief reasoning explaining what you need (1-2 sentences)
+- Provide ONE specific follow_up_question
+- Specify question_for as "user" or "devils_advocate"
+
+ONLY output the JSON. No additional text before or after.
+"""
+        
+        print(f"[DEBUG] ===== FINAL JUDGE PROMPT =====")
+        print(f"[DEBUG] {judge_prompt[:800]}..." if len(judge_prompt) > 800 else f"[DEBUG] {judge_prompt}")
+        print(f"[DEBUG] ==================================")
+        
+        # Generate Judge's ruling using LangGraph agent with memory
+        with st.spinner("⚖️ The Judge is reviewing the arguments..."):
+            start_time = time.time()
+            
+            # Create thread ID for the judge (separate from Devil's Advocate)
+            judge_thread_id = f"judge_{sid}_{aid}"
+            
+            print(f"[DEBUG] Using Judge agent with thread_id: {judge_thread_id}")
+            
+            # Invoke the agent with memory
+            config = {"configurable": {"thread_id": judge_thread_id}}
+            
+            response_text = ""
+            try:
+                # Stream response from agent
+                for chunk in judge_agent.stream(
+                    {"messages": [HumanMessage(content=judge_prompt)]},
+                    config=config
+                ):
+                    # Extract content from agent response
+                    if "agent" in chunk:
+                        for message in chunk["agent"]["messages"]:
+                            if hasattr(message, 'content') and message.content:
+                                response_text += message.content
+            except Exception as e:
+                print(f"[ERROR] Judge agent streaming failed: {e}")
+                # Fallback to invoke if streaming fails
+                result = judge_agent.invoke(
+                    {"messages": [HumanMessage(content=judge_prompt)]},
+                    config=config
+                )
+                if "messages" in result:
+                    for msg in result["messages"]:
+                        if isinstance(msg, AIMessage) and msg.content:
+                            response_text += msg.content
+            
+            judge_time = time.time() - start_time
+            print(f"[BENCHMARK] Judge ruling completed in {judge_time:.3f}s")
+            print(f"[DEBUG] Judge response length: {len(response_text)} chars")
+            print(f"[DEBUG] Response preview: {response_text[:100]}...")
+        
+        # Parse Judge's response to extract decision/follow-up
+        parsed_judgment = parse_judge_response(response_text)
+        
+        result = {
+            "execution_id": exec_id,
+            "student_id": sid,
+            "full_response": response_text,
+            "decision_made": parsed_judgment.get("decision_made", False),
+            "winner": parsed_judgment.get("winner"),
+            "reasoning": parsed_judgment.get("reasoning", response_text),
+            "follow_up_question": parsed_judgment.get("follow_up_question"),
+            "question_for": parsed_judgment.get("question_for"),
+            "timestamp": datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        }
+        
+        print("[DEBUG] Judge result:", {**result, "full_response": f"{result['full_response'][:100]}..."})
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] Judge ruling failed: {e}")
+        st.error(f"Judge ruling failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "execution_id": exec_id,
+            "student_id": sid,
+            "full_response": f"Error generating Judge ruling: {str(e)}",
+            "decision_made": False,
+            "winner": None,
+            "reasoning": "Error occurred",
+            "follow_up_question": None,
+            "question_for": None,
+            "timestamp": datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        }
+
+
+def parse_judge_response(response_text: str) -> Dict[str, Any]:
+    """Parse the Judge's response to extract structured information (handles both JSON and plain text)."""
+    import re
+    
+    result = {
+        "decision_made": False,
+        "winner": None,
+        "reasoning": response_text,
+        "follow_up_question": None,
+        "question_for": None
+    }
+    
+    # First try to parse as JSON (if the judge returns structured data)
+    try:
+        # Look for JSON in the response
+        json_match = re.search(r'\{[^{}]*"decision_made"[^{}]*\}', response_text, re.DOTALL)
+        if json_match:
+            import json
+            parsed = json.loads(json_match.group(0))
+            print(f"[DEBUG] Successfully parsed JSON from judge response")
+            return {
+                "decision_made": parsed.get("decision_made", False),
+                "winner": parsed.get("winner"),
+                "reasoning": parsed.get("reasoning", response_text),
+                "follow_up_question": parsed.get("follow_up_question"),
+                "question_for": parsed.get("question_for")
+            }
+    except Exception as e:
+        print(f"[DEBUG] Not JSON format, parsing as plain text: {e}")
+    
+    # Parse as plain text
+    # Look for decision indicators
+    if re.search(r'\b(winner|victor|stronger argument|decided in favor|ruling in favor)\b', response_text, re.IGNORECASE):
+        result["decision_made"] = True
+        
+        # Determine winner
+        if re.search(r'\b(user|student|you)\s+(win|won|has the stronger|victory|favor)\b', response_text, re.IGNORECASE):
+            result["winner"] = "user"
+        elif re.search(r'\b(devil\'?s? advocate|opponent)\s+(win|won|has the stronger|victory|favor)\b', response_text, re.IGNORECASE):
+            result["winner"] = "devils_advocate"
+    
+    # Look for follow-up question indicators
+    question_match = re.search(r'(question for|I ask|I need to ask|please clarify|can you explain)[:\s]+(user|devil\'?s? advocate|student|opponent)?[:\s]*(.+?)(?:\n\n|\Z)', response_text, re.IGNORECASE | re.DOTALL)
+    
+    if question_match:
+        result["decision_made"] = False
+        result["follow_up_question"] = question_match.group(3).strip() if question_match.group(3) else None
+        
+        # Determine who the question is for
+        target = question_match.group(2)
+        if target and re.search(r'\b(user|student|you)\b', target, re.IGNORECASE):
+            result["question_for"] = "user"
+        elif target and re.search(r'\b(devil|advocate|opponent)\b', target, re.IGNORECASE):
+            result["question_for"] = "devils_advocate"
+    
+    print(f"[DEBUG] Parsed judge response: {result}")
+    return result
+
+
 # --- Legacy Context Gathering Functions Removed ---
 # These functions are no longer needed since we use the ContextCache system
 # which provides better performance and more structured context management
@@ -1495,7 +1925,15 @@ def main() -> None:
         if not sa:
             return
         aid = str(sa['assignment_id'])
-
+        
+        # Store assignment info in session state
+        st.session_state['assignment_id'] = aid
+        is_debate_mode = st.session_state.get('is_debate_mode', False)
+        
+        # Show mode indicator
+        if is_debate_mode:
+            st.info("🎭 **Debate Mode** - Devil's Advocate Assignment")
+        
         qrec = load_questions(aid)
         if not qrec:
             return
@@ -1586,56 +2024,62 @@ def main() -> None:
         else:
             print("[MEMORY DEBUG] No active assignment session")
 
-        # --- Questions and Answers (single column) ---
-        for i in range(1, 4):
-            st.markdown(f"<div class='question-card' style='margin-bottom:0.3rem; font-size:1.08rem;'><b>Q{i}:</b> {qrec.get(f'Question{i}', '')}</div>", unsafe_allow_html=True)
-            key = f'a{i}_r{round_no}_reset{reset_counter}'
-            val_key = f'q{i}_val'
-            
-            # If we have previous answers AND no current session state value, populate session state with them
-            if previous_answers and f'q{i}' in previous_answers and not st.session_state.get(val_key):
-                st.session_state[val_key] = previous_answers[f'q{i}']
-                print(f"[DEBUG] Q{i} populated from previous session: {previous_answers[f'q{i}'][:50]}...")
-            elif st.session_state.get(val_key):
-                print(f"[DEBUG] Q{i} using existing session state value: {st.session_state.get(val_key)[:50]}...")
-            
-            # Use session state value (which now contains previous answer if available, or retry answer if updated)
-            current_value = st.session_state.get(val_key, '')
-            print(f"[DEBUG] Q{i} current_value: {current_value[:50]}..." if current_value else f"[DEBUG] Q{i} current_value: (empty)")
-            answers[f'q{i}'] = st.text_area("Your Answer", value=current_value, key=key, on_change=None)
-            st.session_state[val_key] = answers[f'q{i}']
-            # After submission, show feedback/score under each answer
-            if fb and submitted:
-                score = fb.get(f'new_score{i}', fb.get(f'score{i}', 0))
-                text = fb.get(f'new_feedback{i}', fb.get(f'feedback{i}', ''))
-                try:
-                    score = float(score) if score else 0
-                except (ValueError, TypeError):
-                    score = 0
-                if score >= THRESHOLD_SCORE:
-                    score_class = 'score-high'
-                    emoji = '✅'
-                elif score >= THRESHOLD_SCORE - 2:
-                    score_class = 'score-mid'
-                    emoji = '⚠️'
-                else:
-                    score_class = 'score-low'
-                    emoji = '❌'
-                st.markdown(f"""
-                    <div class='feedback-score-card' style='background:rgba(180,255,80,0.18); color:#fff; border-radius:8px 8px 0 0; padding:1rem; margin-bottom:0; font-size:1.08rem;'>
-                        <span class='{score_class}'>{emoji} Score: {score}/10</span>
+        # --- Debate Topic and User's Argument ---
+        # Display the debate topic from Question1
+        debate_topic = qrec.get('Question1', '')
+        st.markdown(f"<div class='question-card' style='margin-bottom:0.8rem; font-size:1.15rem;'><b>Debate Topic:</b> {debate_topic}</div>", unsafe_allow_html=True)
+        
+        # Single answer box for user's argument
+        key = f'a1_r{round_no}_reset{reset_counter}'
+        val_key = 'q1_val'
+        
+        # If we have previous answer AND no current session state value, populate session state
+        if previous_answers and 'q1' in previous_answers and not st.session_state.get(val_key):
+            st.session_state[val_key] = previous_answers['q1']
+            print(f"[DEBUG] Argument populated from previous session: {previous_answers['q1'][:50]}...")
+        elif st.session_state.get(val_key):
+            print(f"[DEBUG] Argument using existing session state value: {st.session_state.get(val_key)[:50]}...")
+        
+        # Use session state value
+        current_value = st.session_state.get(val_key, '')
+        print(f"[DEBUG] Current argument value: {current_value[:50]}..." if current_value else "[DEBUG] Current argument value: (empty)")
+        answers['q1'] = st.text_area("Your Argument", value=current_value, key=key, height=200, 
+                                      help="Present your position on this topic. Build a strong, logical argument.")
+        st.session_state[val_key] = answers['q1']
+        
+        # Set q2 and q3 to empty for debate mode
+        answers['q2'] = ''
+        answers['q3'] = ''
+        
+        # After submission, show Devil's Advocate response (no score display)
+        if fb and submitted:
+            text = fb.get('new_feedback1', fb.get('feedback1', ''))
+            if text:
+                st.markdown(
+                    f"""
+                    <div style='background:rgba(255,90,90,0.15); color:#fff; border-radius:8px; padding:1.2rem; margin-bottom:0.7rem; margin-top:0.5rem; font-size:1.08rem; border-left: 4px solid rgba(255,90,90,0.6);'>
+                        <b>😈 Devil's Advocate Response:</b><br><br>{text}
                     </div>
-                """, unsafe_allow_html=True)
-                if text:
-                    st.markdown(
-                        f"""
-                        <div style='background:rgba(180,255,80,0.18); color:#fff; border-radius:0 0 8px 8px; padding:1rem; margin-bottom:0.7rem; font-size:1.08rem; margin-top:0;'>
-                            <b>Feedback:</b><br>{text}
-                        </div>
-                        """, unsafe_allow_html=True
-                    )
-                else:
-                    st.info(f"No feedback available for Q{i}")
+                    """, unsafe_allow_html=True
+                )
+                
+                # Show buttons to continue debating or call the judge
+                if not st.session_state.get('show_continue_debate', False) and not st.session_state.get('judge_mode', False):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button('💬 Respond to Devil\'s Advocate', key='show_continue_btn', use_container_width=True, type='primary'):
+                            st.session_state['show_continue_debate'] = True
+                            # Scroll to continue section
+                            if SCROLL_AVAILABLE:
+                                st.session_state['scroll_to_continue'] = True
+                            rerun()
+                    with col2:
+                        if st.button('⚖️ Call the Judge', key='call_judge_btn', use_container_width=True):
+                            st.session_state['judge_mode'] = True
+                            st.session_state['calling_judge'] = True
+                            rerun()
+            else:
+                st.info("No response from Devil's Advocate yet")
 
         # --- Submission logic ---
         st.markdown("<div style='height:1.2rem;'></div>", unsafe_allow_html=True)
@@ -1645,31 +2089,35 @@ def main() -> None:
         if not fb and not awaiting_resubmit:
             # Define callback function for submission
             def handle_submit():
-                # Prevent submission if any answer is empty
-                if any(not answers[f'q{i}'].strip() for i in range(1, 4)):
-                    st.session_state['submit_error'] = 'Please fill in all answers before submitting.'
+                # Prevent submission if answer is empty
+                if not answers['q1'].strip():
+                    st.session_state['submit_error'] = 'Please provide your argument before submitting.'
                     return
                 
                 # Process submission
                 with st.spinner('Submitting your answers...'):
+                    user_arg = answers.get('q1', '')
+                    
+                    # FIRST: Add user's argument to context so Devil's Advocate can see it
+                    if user_arg:
+                        assignment_memory.add_student_answer('1', user_arg)
+                        print(f"[DEBUG] Added user argument to context BEFORE calling Devil's Advocate: {user_arg[:50]}...")
+                    
+                    # Record answers to sheet
                     record_answers(exec_id, sid, aid, answers)
+                    
+                    # THEN: Call Devil's Advocate (now it can see the user's argument in history)
                     grade_res = run_grading(exec_id, sid, aid, answers)
+                    
                     if grade_res:
                         # Queue grading data for background writing
                         background_writer.write_async('grading', grade_res)
                         
-                        # Populate context cache with responses and feedback
-                        for i in range(1, 4):
-                            response = answers.get(f'q{i}', '')
-                            feedback = grade_res.get(f'feedback{i}', '')
-                            score = grade_res.get(f'score{i}', '')
-                            
-                            # Add to new memory system
-                            assignment_memory.add_student_answer(str(i), response)
-                            assignment_memory.add_grading_result(str(i), int(score) if score else 0, feedback)
-                            
-                            # Also add to backward compatibility cache
-                            context_cache.add_response_and_feedback(str(i), response, feedback, score)
+                        # Now add Devil's Advocate response to the context
+                        devils_response = grade_res.get('feedback1', '')
+                        if devils_response:
+                            assignment_memory.add_grading_result('1', 0, devils_response)
+                            print(f"[DEBUG] Added Devil's Advocate response to context: {devils_response[:50]}...")
                         
                         # Update started status to TRUE if it was FALSE
                         if started_status == 'FALSE':
@@ -1696,31 +2144,44 @@ def main() -> None:
         # --- Completion/Follow-up logic ---
         if fb:
             st.markdown("<div style='height:0.7rem;'></div>", unsafe_allow_html=True)
-            scores = [float(fb.get(f'new_score{i}', fb.get(f'score{i}', 0))) for i in range(1, 4)]
-            if all(score >= THRESHOLD_SCORE for score in scores):
-                st.success('🎉 You have successfully completed this assignment!')
-            else:
-                st.warning(f'You need scores of {THRESHOLD_SCORE} or higher on all questions to complete this assignment.')
-                # If awaiting_resubmit, show resubmit button above conversation
-                if awaiting_resubmit:
-                    resubmit = st.button('Resubmit', key='resubmit_btn', use_container_width=True)
-                    if resubmit:
-                        # Submit new answers
-                        if any(not answers[f'q{i}'].strip() for i in range(1, 4)):
-                            st.toast('Please fill in all answers before resubmitting.', icon='⚠️')
-                        else:
-                            with st.spinner('Submitting your answers...'):
-                                record_answers(exec_id, sid, aid, answers)
-                                grade_res = run_grading(exec_id, sid, aid, answers)
-                                if grade_res:
-                                    sheets.grading.append_row(grade_res)
-                                    # Skip evaluation for faster response - use grading directly
-                                    st.session_state['feedback'] = grade_res
-                                    st.session_state['submitted'] = True
-                                    st.session_state['awaiting_resubmit'] = False
-                                else:
-                                    st.error("Failed to grade your answers. Please try again.")
-                            rerun()
+            # For debate mode, there's no score-based completion
+            # The debate continues through conversation
+            st.info("💬 Continue the debate by asking questions or making new arguments in the conversation section below.")
+            # If awaiting_resubmit, show resubmit button above conversation
+            if awaiting_resubmit:
+                resubmit = st.button('Resubmit', key='resubmit_btn', use_container_width=True)
+                if resubmit:
+                    # Submit new answers
+                    if not answers['q1'].strip():
+                        st.toast('Please provide your argument before resubmitting.', icon='⚠️')
+                    else:
+                        with st.spinner('Submitting your answers...'):
+                            user_arg = answers.get('q1', '')
+                            
+                            # Add user's argument to context first
+                            if user_arg:
+                                assignment_memory.add_student_answer('1', user_arg)
+                                print(f"[DEBUG] Added user argument to context (resubmit)")
+                            
+                            record_answers(exec_id, sid, aid, answers)
+                            grade_res = run_grading(exec_id, sid, aid, answers)
+                            
+                            if grade_res:
+                                sheets.grading.append_row(grade_res)
+                                
+                                # Add Devil's Advocate response to context
+                                devils_response = grade_res.get('feedback1', '')
+                                if devils_response:
+                                    assignment_memory.add_grading_result('1', 0, devils_response)
+                                    print(f"[DEBUG] Added Devil's Advocate response to context (resubmit)")
+                                
+                                # Skip evaluation for faster response - use grading directly
+                                st.session_state['feedback'] = grade_res
+                                st.session_state['submitted'] = True
+                                st.session_state['awaiting_resubmit'] = False
+                            else:
+                                st.error("Failed to generate Devil's Advocate response. Please try again.")
+                        rerun()
                 # Add enhanced feedback button
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1789,103 +2250,234 @@ def main() -> None:
                         
                         rerun()
 
-        # --- Retry Mode: Show new question blocks below everything ---
-        if st.session_state.get('retry_mode', False):
-            # Place scroll anchor at the beginning of retry section
-            if SCROLL_AVAILABLE and st.session_state.get('scroll_to_retry', False):
-                scroll_to_here(0, key='retry_section_anchor')
-                st.session_state['scroll_to_retry'] = False
+        # --- Continue Debate: Show response box after Devil's Advocate responds ---
+        if fb and st.session_state.get('show_continue_debate', False):
+            # Place scroll anchor at the beginning of continue debate section
+            if SCROLL_AVAILABLE and st.session_state.get('scroll_to_continue', False):
+                scroll_to_here(0, key='continue_section_anchor')
+                st.session_state['scroll_to_continue'] = False
             
             st.markdown("<div style='height:2rem;'></div>", unsafe_allow_html=True)
             st.markdown("---")
-            st.markdown(f"<h2 style='text-align: center; margin-bottom: 1.5rem;'>🔄 Retry Assignment</h2>", unsafe_allow_html=True)
-            st.markdown(f"<p style='text-align: center; color: #666; margin-bottom: 2rem;'>Fill in your new answers below and click Resubmit when ready.</p>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='text-align: center; margin-bottom: 1.5rem;'>💬 Continue the Debate</h2>", unsafe_allow_html=True)
+            st.markdown(f"<p style='text-align: center; color: #666; margin-bottom: 2rem;'>Respond to the Devil's Advocate's counter-argument below.</p>", unsafe_allow_html=True)
             
-            retry_answers: dict[str, str] = {}
+            continue_answers: dict[str, str] = {}
             
-            # Show retry question blocks
-            for i in range(1, 4):
-                st.markdown(f"<div class='question-card' style='margin-bottom:0.3rem; font-size:1.08rem;'><b>Q{i}:</b> {qrec.get(f'Question{i}', '')}</div>", unsafe_allow_html=True)
-                retry_key = f'retry_a{i}_counter{st.session_state.get("retry_counter", 0)}'
-                retry_val_key = f'retry_q{i}_val'
-                retry_answers[f'q{i}'] = st.text_area("Your New Answer", value=st.session_state.get(retry_val_key, ''), key=retry_key, on_change=None)
-                st.session_state[retry_val_key] = retry_answers[f'q{i}']
+            # Show debate topic and response box
+            st.markdown(f"<div class='question-card' style='margin-bottom:0.8rem; font-size:1.15rem;'><b>Debate Topic:</b> {debate_topic}</div>", unsafe_allow_html=True)
+            continue_key = f'continue_a1_counter{st.session_state.get("continue_counter", 0)}'
+            continue_val_key = 'continue_q1_val'
+            continue_answers['q1'] = st.text_area("Your Response to Devil's Advocate", 
+                                                  value=st.session_state.get(continue_val_key, ''), 
+                                                  key=continue_key, 
+                                                  height=200,
+                                                  help="Counter the Devil's Advocate's arguments and strengthen your position.")
+            st.session_state[continue_val_key] = continue_answers['q1']
             
-            # Retry submission buttons
+            # Set q2 and q3 to empty
+            continue_answers['q2'] = ''
+            continue_answers['q3'] = ''
+            
+            # Continue debate submission button
             col1, col2 = st.columns(2)
             with col1:
-                retry_submit = st.button('Resubmit New Answers', key='retry_submit_btn', use_container_width=True)
+                continue_submit = st.button('Submit Response', key='continue_submit_btn', use_container_width=True, type='primary')
             with col2:
-                cancel_retry = st.button('Cancel Retry', key='cancel_retry_btn', use_container_width=True)
+                collapse_continue = st.button('Collapse', key='collapse_continue_btn', use_container_width=True)
             
-            if retry_submit:
-                # Prevent submission if any answer is empty
-                if any(not retry_answers[f'q{i}'].strip() for i in range(1, 4)):
-                    st.toast('Please fill in all answers before resubmitting.', icon='⚠️')
+            if continue_submit:
+                # Get the actual current value from session state
+                user_response = continue_answers.get('q1', '').strip()
+                
+                # Prevent submission if answer is empty
+                if not user_response:
+                    st.toast('Please provide your response before submitting.', icon='⚠️')
                 else:
-                    with st.spinner('Submitting your new answers...'):
-                        # Record new answers
-                        record_answers(exec_id, sid, aid, retry_answers)
-                        # Grade new answers
-                        grade_res = run_grading(exec_id, sid, aid, retry_answers)
-                        if grade_res:
-                            # Queue grading data for background writing
-                            background_writer.write_async('grading', grade_res)
-                            
-                            # Populate context cache with retry responses and feedback
-                            for i in range(1, 4):
-                                response = retry_answers.get(f'q{i}', '')
-                                feedback = grade_res.get(f'feedback{i}', '')
-                                score = grade_res.get(f'score{i}', '')
-                                
-                                # Add to new memory system
-                                assignment_memory.add_student_answer(str(i), response)
-                                assignment_memory.add_grading_result(str(i), int(score) if score else 0, feedback)
-                                
-                                # Also add to backward compatibility cache
-                                context_cache.add_response_and_feedback(str(i), response, feedback, score)
-                            
-                            # FIX 1: Replace text in answer boxes at the top with new answers
-                            for i in range(1, 4):
-                                st.session_state[f'q{i}_val'] = retry_answers[f'q{i}']
-                                print(f"[RETRY] Updated session state q{i}_val with: {retry_answers[f'q{i}'][:50]}...")
-                            
-                            # FIX 2: Erase any conversation text and reset conversation state
-                            st.session_state['conversation_text'] = ''
-                            st.session_state['last_processed_question'] = ''
-                            st.session_state['conv_counter'] = 0
-                            st.session_state['last_conversation_response'] = ''
-                            
-                            # Clear retry mode and reset to show new feedback
-                            st.session_state['retry_mode'] = False
-                            st.session_state['feedback'] = grade_res
-                            st.session_state['submitted'] = True
-                            st.session_state['awaiting_resubmit'] = False
-                            
-                            # Clear retry answer values
-                            for i in range(1, 4):
-                                st.session_state[f'retry_q{i}_val'] = ''
-                            
-                            # FIX 3: Force a complete rerun to ensure updates are visible
-                            st.session_state['retry_completed'] = True
-                            st.session_state['reset_counter'] = st.session_state.get('reset_counter', 0) + 1
-                            
-                            # FIX 4: Trigger scroll to top
-                            if SCROLL_AVAILABLE:
-                                st.session_state['scroll_to_top'] = True
-                            
-                            st.success('New answers submitted successfully!')
-                            st.rerun()
-                        else:
-                            st.error("Failed to grade your new answers. Please try again.")
+                    # Build answers dict with current value
+                    continue_submit_answers = {'q1': user_response, 'q2': '', 'q3': ''}
+                    
+                    # FIRST: Add user's response to context so Devil's Advocate can see it
+                    if user_response:
+                        assignment_memory.add_student_answer('1', user_response)
+                        print(f"[DEBUG] Added user response to context BEFORE calling Devil's Advocate: {user_response[:50]}...")
+                    
+                    # Record new response to sheet
+                    record_answers(exec_id, sid, aid, continue_submit_answers)
+                    
+                    # THEN: Get Devil's Advocate response
+                    with st.spinner("Devil's Advocate is considering your response..."):
+                        grade_res = run_grading(exec_id, sid, aid, continue_submit_answers)
+                    
+                    if grade_res:
+                        # Queue grading data for background writing
+                        background_writer.write_async('grading', grade_res)
+                        
+                        # Add Devil's Advocate's response to context
+                        devils_response = grade_res.get('feedback1', '')
+                        if devils_response:
+                            assignment_memory.add_grading_result('1', 0, devils_response)
+                            print(f"[DEBUG] Added Devil's Advocate response to context: {devils_response[:50]}...")
+                        
+                        # Update the top answer box with the new response
+                        st.session_state['q1_val'] = continue_answers['q1']
+                        print(f"[DEBATE] Updated argument with: {continue_answers['q1'][:50]}...")
+                        
+                        # Store new Devil's Advocate response
+                        st.session_state['feedback'] = grade_res
+                        st.session_state['submitted'] = True
+                        st.session_state['show_continue_debate'] = False
+                        
+                        # Clear continue answer value
+                        st.session_state['continue_q1_val'] = ''
+                        
+                        # Increment counter to force new keys on next continue
+                        st.session_state['continue_counter'] = st.session_state.get('continue_counter', 0) + 1
+                        print(f"[DEBATE] Incremented continue counter to {st.session_state['continue_counter']}")
+                        
+                        # Scroll to top to see updated argument and Devil's Advocate response
+                        if SCROLL_AVAILABLE:
+                            st.session_state['scroll_to_top'] = True
+                        
+                        st.success('Response submitted! Scroll up to see the Devil\'s Advocate\'s counter-argument.')
+                        st.rerun()
+                    else:
+                        st.error("Failed to generate Devil's Advocate response. Please try again.")
             
-            if cancel_retry:
-                # Clear retry mode
-                st.session_state['retry_mode'] = False
-                # Clear retry answer values
-                for i in range(1, 4):
-                    st.session_state[f'retry_q{i}_val'] = ''
+            if collapse_continue:
+                # Hide continue debate section (keep the text so it persists if reopened)
+                st.session_state['show_continue_debate'] = False
+                # Don't clear continue_q1_val - preserve user's in-progress typing
                 rerun()
+
+        # --- Judge Mode: Show judge ruling and handle follow-ups ---
+        if st.session_state.get('judge_mode', False):
+            st.markdown("<div style='height:2rem;'></div>", unsafe_allow_html=True)
+            st.markdown("---")
+            
+            # Call judge if this is the first time or if we just got a response to judge's question
+            if st.session_state.get('calling_judge', False):
+                judge_result = run_judge(exec_id, sid, aid)
+                st.session_state['judge_result'] = judge_result
+                st.session_state['calling_judge'] = False
+            
+            judge_result = st.session_state.get('judge_result')
+            
+            if judge_result:
+                # Display judge's ruling (use reasoning field if available, otherwise full response)
+                st.markdown(f"<h2 style='text-align: center; margin-bottom: 1.5rem;'>⚖️ Judge's Ruling</h2>", unsafe_allow_html=True)
+                
+                # Use the parsed reasoning if available, otherwise show full response
+                judge_response = judge_result.get('reasoning', judge_result.get('full_response', ''))
+                
+                # Clean up any JSON artifacts
+                import re
+                # Remove JSON structure if present
+                judge_response = re.sub(r'```json\s*\{.*?\}\s*```', '', judge_response, flags=re.DOTALL)
+                judge_response = re.sub(r'\{[^{}]*"decision_made"[^{}]*\}', '', judge_response, flags=re.DOTALL)
+                judge_response = judge_response.strip()
+                
+                if not judge_response:
+                    judge_response = judge_result.get('full_response', 'No ruling available')
+                
+                st.markdown(
+                    f"""
+                    <div style='background:rgba(255,215,0,0.15); color:#fff; border-radius:8px; padding:1.5rem; margin-bottom:1rem; font-size:1.08rem; border-left: 4px solid rgba(255,215,0,0.7);'>
+                        <b>⚖️ Judge:</b><br><br>{judge_response}
+                    </div>
+                    """, unsafe_allow_html=True
+                )
+                
+                # Check if decision was made
+                if judge_result.get('decision_made'):
+                    winner = judge_result.get('winner')
+                    if winner == 'user':
+                        st.success("🎉 Congratulations! The Judge has ruled in your favor!")
+                    elif winner == 'devils_advocate':
+                        st.info("😈 The Judge has ruled in favor of the Devil's Advocate.")
+                    else:
+                        st.warning("⚖️ The Judge could not determine a clear winner.")
+                    
+                    # End judge mode
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button('End Round', key='end_judge_btn', use_container_width=True, type='primary'):
+                            st.session_state['judge_mode'] = False
+                            st.session_state['judge_result'] = None
+                            st.session_state['judge_history'] = ''
+                            rerun()
+                    with col2:
+                        if st.button('Continue Debating', key='continue_after_judge_btn', use_container_width=True):
+                            st.session_state['judge_mode'] = False
+                            st.session_state['judge_result'] = None
+                            rerun()
+                
+                # If judge has a follow-up question
+                elif judge_result.get('follow_up_question'):
+                    follow_up = judge_result.get('follow_up_question')
+                    question_for = judge_result.get('question_for')
+                    
+                    st.markdown(f"<p style='text-align: center; color: #ffd700; margin-top: 1rem; font-size: 1.1rem;'><b>The Judge needs clarification...</b></p>", unsafe_allow_html=True)
+                    
+                    if question_for == 'user':
+                        st.markdown(f"<p style='text-align: center; margin-bottom: 1.5rem;'>Please answer the Judge's question:</p>", unsafe_allow_html=True)
+                        
+                        judge_q_key = f'judge_user_response_{st.session_state.get("judge_counter", 0)}'
+                        judge_val_key = 'judge_user_response_val'
+                        user_response = st.text_area("Your Response to the Judge", 
+                                                     value=st.session_state.get(judge_val_key, ''),
+                                                     key=judge_q_key,
+                                                     height=150,
+                                                     help="Answer the Judge's question to strengthen your argument.")
+                        st.session_state[judge_val_key] = user_response
+                        
+                        if st.button('Submit Response to Judge', key='submit_judge_user_btn', use_container_width=True, type='primary'):
+                            if not user_response.strip():
+                                st.toast('Please provide a response to the Judge.', icon='⚠️')
+                            else:
+                                # Add to judge history
+                                judge_hist = st.session_state.get('judge_history', '')
+                                judge_hist += f"\n\nJudge asked User: {follow_up}\nUser responded: {user_response}"
+                                st.session_state['judge_history'] = judge_hist
+                                
+                                # Clear response value and call judge again
+                                st.session_state['judge_user_response_val'] = ''
+                                st.session_state['judge_counter'] = st.session_state.get('judge_counter', 0) + 1
+                                st.session_state['calling_judge'] = True
+                                rerun()
+                    
+                    elif question_for == 'devils_advocate':
+                        st.markdown(f"<p style='text-align: center; margin-bottom: 1.5rem;'>The Devil's Advocate must respond...</p>", unsafe_allow_html=True)
+                        
+                        # Show spinner and get Devil's Advocate response automatically
+                        with st.spinner("😈 Devil's Advocate is responding to the Judge..."):
+                            # Create a context for Devil's Advocate to answer the judge's question
+                            da_answer_context = {
+                                'q1': f"Judge's question: {follow_up}\n\nPlease provide a clear, direct answer that supports your position in the debate."
+                            }
+                            
+                            # Use the grading function but with different context
+                            da_response = run_grading(exec_id, sid, aid, da_answer_context)
+                            da_answer = da_response.get('feedback1', 'No response generated')
+                            
+                            # Display Devil's Advocate's response
+                            st.markdown(
+                                f"""
+                                <div style='background:rgba(255,90,90,0.15); color:#fff; border-radius:8px; padding:1.2rem; margin-bottom:0.7rem; margin-top:0.5rem; font-size:1.08rem; border-left: 4px solid rgba(255,90,90,0.6);'>
+                                    <b>😈 Devil's Advocate Response:</b><br><br>{da_answer}
+                                </div>
+                                """, unsafe_allow_html=True
+                            )
+                            
+                            # Add to judge history
+                            judge_hist = st.session_state.get('judge_history', '')
+                            judge_hist += f"\n\nJudge asked Devil's Advocate: {follow_up}\nDevil's Advocate responded: {da_answer}"
+                            st.session_state['judge_history'] = judge_hist
+                            
+                            # Show button to have judge review the response
+                            if st.button('Judge Reviews Response', key='judge_review_da_btn', use_container_width=True, type='primary'):
+                                st.session_state['calling_judge'] = True
+                                rerun()
 
     # --- Footer ---
     st.markdown("""
