@@ -196,8 +196,8 @@ class PromptManager:
             return None
             
         try:
-            # Get the assignment record
-            assignment = self.sheets_manager.assignments.get_by_id(assignment_id)
+            # Get the assignment record using the fetch method
+            assignment = self.sheets_manager.assignments.fetch(assignment_id)
             
             if not assignment:
                 return None
