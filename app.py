@@ -193,13 +193,16 @@ class PromptManager:
             The prompt text or None if not found
         """
         if not self.sheets_manager:
+            print(f"[DEBUG] sheets_manager is None, cannot fetch prompt for assignment {assignment_id}")
             return None
             
         try:
             # Get the assignment record using the fetch method
+            print(f"[DEBUG] Fetching assignment {assignment_id} for prompt type {prompt_type}")
             assignment = self.sheets_manager.assignments.fetch(assignment_id)
             
             if not assignment:
+                print(f"[DEBUG] No assignment found for ID {assignment_id}")
                 return None
             
             # Map prompt type to column name
@@ -210,13 +213,21 @@ class PromptManager:
             
             column_name = column_map.get(prompt_type)
             if not column_name:
+                print(f"[DEBUG] Invalid prompt type: {prompt_type}")
                 return None
             
             prompt = assignment.get(column_name, "").strip()
+            if prompt:
+                print(f"[DEBUG] Successfully loaded {prompt_type} prompt (length: {len(prompt)})")
+            else:
+                print(f"[DEBUG] No prompt found in column {column_name} for assignment {assignment_id}")
             return prompt if prompt else None
             
         except Exception as e:
             st.error(f"Error loading prompt from assignments sheet: {e}")
+            print(f"[DEBUG] Exception loading prompt: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def get_prompt_cached(self, assignment_id: str, prompt_type: str) -> Optional[str]:
@@ -417,12 +428,8 @@ if LLM_PROVIDER == "gemini":
         st.warning("Gemini API key not found. Falling back to OpenAI.")
         LLM_PROVIDER = "openai"
 
-# Initialize prompt manager (will be updated with sheets_manager after initialization)
-@st.cache_resource
-def get_prompt_manager():
-    return PromptManager(GCP_CREDENTIALS)
-
-prompt_manager = get_prompt_manager()
+# Prompt manager will be initialized after sheets are set up
+prompt_manager = None
 
 # Generic Google Sheets wrapper with caching
 class Sheet:
@@ -650,8 +657,15 @@ def get_sheets() -> DataSheets:
 
 sheets = get_sheets()
 
-# Update prompt manager with sheets reference
-prompt_manager.sheets_manager = sheets
+# Initialize prompt manager with sheets reference
+@st.cache_resource
+def get_prompt_manager(_sheets):
+    """Initialize prompt manager with sheets reference. 
+    The _sheets parameter ensures it's recreated if sheets changes."""
+    pm = PromptManager(GCP_CREDENTIALS, sheets_manager=_sheets)
+    return pm
+
+prompt_manager = get_prompt_manager(sheets)
 
 # --- OLD CONTEXT CACHE SYSTEM (COMMENTED OUT) ---
 # class ContextCache:
