@@ -87,13 +87,14 @@ DEFAULT_MODEL = {
 # ===========================
 
 class PromptManager:
-    def __init__(self, credentials_dict: dict):
+    def __init__(self, credentials_dict: dict, sheets_manager=None):
         """Initialize the prompt manager with Google credentials."""
         self.credentials = Credentials.from_service_account_info(
             credentials_dict,
             scopes=['https://www.googleapis.com/auth/documents.readonly']
         )
         self.service = build('docs', 'v1', credentials=self.credentials)
+        self.sheets_manager = sheets_manager
         self._prompts_cache = {}
     
     def get_prompt_from_doc(self, doc_id: str, prompt_name: str) -> Optional[str]:
@@ -179,6 +180,53 @@ class PromptManager:
             self._prompts_cache[cache_key] = self.get_prompt_from_doc(doc_id, prompt_name)
         
         return self._prompts_cache[cache_key]
+    
+    def get_prompt_from_assignment(self, assignment_id: str, prompt_type: str) -> Optional[str]:
+        """
+        Get a prompt from the Google Sheets assignments table.
+        
+        Args:
+            assignment_id: The assignment ID to look up
+            prompt_type: Type of prompt ("grading" or "conversation")
+        
+        Returns:
+            The prompt text or None if not found
+        """
+        if not self.sheets_manager:
+            return None
+            
+        try:
+            # Get the assignment record
+            assignment = self.sheets_manager.assignments.get_by_id(assignment_id)
+            
+            if not assignment:
+                return None
+            
+            # Map prompt type to column name
+            column_map = {
+                "grading": "GradingPrompt",
+                "conversation": "ConversationPrompt"
+            }
+            
+            column_name = column_map.get(prompt_type)
+            if not column_name:
+                return None
+            
+            prompt = assignment.get(column_name, "").strip()
+            return prompt if prompt else None
+            
+        except Exception as e:
+            st.error(f"Error loading prompt from assignments sheet: {e}")
+            return None
+    
+    def get_prompt_cached(self, assignment_id: str, prompt_type: str) -> Optional[str]:
+        """Get a prompt from assignments sheet with caching."""
+        cache_key = f"assignment_{assignment_id}_{prompt_type}"
+        
+        if cache_key not in self._prompts_cache:
+            self._prompts_cache[cache_key] = self.get_prompt_from_assignment(assignment_id, prompt_type)
+        
+        return self._prompts_cache[cache_key]
 
 # Example usage and prompt templates
 def get_default_prompts() -> Dict[str, str]:
@@ -252,7 +300,6 @@ Respond in a conversational tone, as if you're having a one-on-one tutoring sess
 # ===========================
 # Main Application (from source_app.py)
 # ===========================
-
 
 # --- Custom CSS for Modern Look ---
 st.markdown('''
@@ -370,7 +417,7 @@ if LLM_PROVIDER == "gemini":
         st.warning("Gemini API key not found. Falling back to OpenAI.")
         LLM_PROVIDER = "openai"
 
-# Initialize prompt manager
+# Initialize prompt manager (will be updated with sheets_manager after initialization)
 @st.cache_resource
 def get_prompt_manager():
     return PromptManager(GCP_CREDENTIALS)
@@ -422,7 +469,8 @@ class Sheet:
 class AssignmentsSheet(Sheet):
     def __init__(self, client):
         super().__init__(client, "assignments", [
-            "date", "assignment_id", "Question1", "Question2", "Question3"
+            "date", "assignment_id", "Question1", "Question2", "Question3",
+            "GradingPrompt", "ConversationPrompt"
         ])
 
     def fetch(self, assignment_id: str) -> dict[str, Any]:
@@ -601,6 +649,9 @@ def get_sheets() -> DataSheets:
     return DataSheets(GCP_CREDENTIALS)
 
 sheets = get_sheets()
+
+# Update prompt manager with sheets reference
+prompt_manager.sheets_manager = sheets
 
 # --- OLD CONTEXT CACHE SYSTEM (COMMENTED OUT) ---
 # class ContextCache:
@@ -1063,15 +1114,10 @@ def run_grading_streaming(exec_id: str, sid: str, aid: str, answers: Dict[str, s
         q3_context = context_cache.get_question_context('3')
         conversation_context = context_cache.get_conversation_context()
         
-        # Try to get prompt from Google Docs first
-        doc_id = PROMPT_DOC_IDS.get("grading")
-        prompt_name = PROMPT_NAMES.get("grading")
+        # Try to get prompt from assignments sheet based on assignment_id
+        prompt_template = prompt_manager.get_prompt_cached(aid, "grading")
         
-        if doc_id and doc_id != "YOUR_GRADING_PROMPT_DOC_ID":
-            prompt_template = prompt_manager.get_cached_prompt(doc_id, prompt_name)
-        else:
-            prompt_template = get_default_prompts()["grading_prompt"]
-        
+        # Fall back to default if not found in sheet
         if not prompt_template:
             prompt_template = get_default_prompts()["grading_prompt"]
         
@@ -1356,15 +1402,13 @@ def run_conversation_streaming(exec_id: str, sid: str, user_msg: str) -> Dict[st
         # Combine all contexts
         context_str = f"Question 1 Context:\n{q1_context}\n\nQuestion 2 Context:\n{q2_context}\n\nQuestion 3 Context:\n{q3_context}\n\nConversation History:\n{conversation_context}"
         
-        # Try to get prompt from Google Docs first
-        doc_id = PROMPT_DOC_IDS.get("conversation")
-        prompt_name = PROMPT_NAMES.get("conversation")
+        # Get assignment_id from session state
+        aid = st.session_state.get('assignment_id', '')
         
-        if doc_id and doc_id != "YOUR_CONVERSATION_PROMPT_DOC_ID":
-            prompt_template = prompt_manager.get_cached_prompt(doc_id, prompt_name)
-        else:
-            prompt_template = get_default_prompts()["conversation_prompt"]
+        # Try to get prompt from assignments sheet based on assignment_id
+        prompt_template = prompt_manager.get_prompt_cached(aid, "conversation")
         
+        # Fall back to default if not found in sheet
         if not prompt_template:
             prompt_template = get_default_prompts()["conversation_prompt"]
         
