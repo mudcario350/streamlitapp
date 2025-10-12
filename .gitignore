@@ -1,0 +1,28 @@
+# Ignore environment files and credentials
+.env
+.streamlit/secrets.toml
+mystic-castle-452716-r3-06468c3f2be8.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
