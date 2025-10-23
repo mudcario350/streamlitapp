@@ -8,9 +8,10 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
-langchain-openai
-langchain-google-genai
-langchain-core
-langgraph
+langchain-openai==0.3.35
+langchain-google-genai==2.0.10
+langchain-core==0.3.79
+langgraph==1.0.1
 python-dotenv
-google-generativeai
+google-generativeai==0.8.5
+pydantic==2.12.3
